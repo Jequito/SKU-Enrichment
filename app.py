@@ -27,8 +27,18 @@ st.set_page_config(
 st.markdown("""
 <style>
   @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;500;600;700;800&display=swap');
+  @import url('https://fonts.googleapis.com/icon?family=Material+Icons');
 
   html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
+
+  /* Protect Material Icons glyphs from the Syne font override */
+  [data-testid="stExpanderToggleIcon"],
+  [data-testid="stExpanderToggleIcon"] * {
+    font-family: 'Material Icons' !important;
+    font-size: 18px !important;
+    line-height: 1 !important;
+    color: #4f6ef7 !important;
+  }
   .stApp { background-color: #0d0f14; color: #e8e8e8; }
 
   [data-testid="stSidebar"] {
@@ -112,11 +122,6 @@ st.markdown("""
   [data-testid="stExpander"] summary:hover {
     background: #20243a !important;
   }
-  /* Suppress any text artifact from the toggle icon */
-  [data-testid="stExpanderToggleIcon"] {
-    color: #4f6ef7 !important;
-  }
-
   /* ── Sidebar section labels ── */
   .sidebar-section {
     font-size: 10px; font-weight: 700; letter-spacing: 0.12em;

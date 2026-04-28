@@ -26,33 +26,18 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;500;600;700;800&display=swap');
-  @import url('https://fonts.googleapis.com/icon?family=Material+Icons');
-
-  html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
-
-  /* Protect Material Icons glyphs from the Syne font override */
-  [data-testid="stExpanderToggleIcon"],
-  [data-testid="stExpanderToggleIcon"] * {
-    font-family: 'Material Icons' !important;
-    font-size: 18px !important;
-    line-height: 1 !important;
-    color: #4f6ef7 !important;
-  }
   .stApp { background-color: #0d0f14; color: #e8e8e8; }
 
   [data-testid="stSidebar"] {
     background-color: #12141a;
     border-right: 1px solid #1e2130;
   }
-  [data-testid="stSidebar"] * { font-family: 'Syne', sans-serif !important; }
-
   h1 { font-weight: 800; letter-spacing: -0.03em; color: #ffffff; }
   h2, h3 { font-weight: 700; color: #e0e0e0; }
 
   .stTextInput input, .stSelectbox select, .stNumberInput input {
     background: #1a1d27 !important; border: 1px solid #2a2d3e !important;
-    color: #e8e8e8 !important; font-family: 'DM Mono', monospace !important;
+    color: #e8e8e8 !important;
     border-radius: 6px !important;
   }
 
@@ -70,22 +55,19 @@ st.markdown("""
   /* Value label above thumb */
   [data-testid="stSlider"] [data-testid="stThumbValue"] {
     color: #4f6ef7 !important;
-    font-family: 'DM Mono', monospace !important;
     font-size: 12px !important;
   }
   /* Min/max tick labels */
   [data-testid="stSlider"] [data-testid="stTickBarMin"],
   [data-testid="stSlider"] [data-testid="stTickBarMax"] {
     color: #4a4f6a !important;
-    font-family: 'DM Mono', monospace !important;
   }
 
   /* ── Buttons ── */
   .stButton > button {
     background: linear-gradient(135deg, #4f6ef7, #7c4ff7);
     color: white; border: none; border-radius: 8px;
-    font-family: 'Syne', sans-serif; font-weight: 700;
-    font-size: 15px; padding: 0.6rem 2rem;
+    font-weight: 700; font-size: 15px; padding: 0.6rem 2rem;
     transition: all 0.2s ease; width: 100%;
   }
   .stButton > button:hover { transform: translateY(-1px); box-shadow: 0 4px 20px rgba(79,110,247,0.4); }
@@ -93,14 +75,13 @@ st.markdown("""
 
   .stDownloadButton > button {
     background: #1a1d27; color: #4f6ef7;
-    border: 1px solid #4f6ef7; border-radius: 8px;
-    font-family: 'Syne', sans-serif; font-weight: 600;
+    border: 1px solid #4f6ef7; border-radius: 8px; font-weight: 600;
   }
   .stDownloadButton > button:hover { background: #4f6ef7; color: white; }
 
   /* ── Metrics ── */
   [data-testid="stMetric"] { background: #1a1d27; border: 1px solid #2a2d3e; border-radius: 10px; padding: 1rem; }
-  [data-testid="stMetricValue"] { font-family: 'DM Mono', monospace; font-size: 1.8rem !important; color: #4f6ef7; }
+  [data-testid="stMetricValue"] { font-size: 1.8rem !important; color: #4f6ef7; }
 
   /* ── Progress bar ── */
   .stProgress > div > div { background: linear-gradient(90deg, #4f6ef7, #7c4ff7); border-radius: 4px; }
@@ -114,7 +95,6 @@ st.markdown("""
   }
   [data-testid="stExpander"] summary {
     color: #e8e8e8 !important;
-    font-family: 'Syne', sans-serif !important;
     font-weight: 600 !important;
     padding: 0.6rem 0.8rem !important;
     border-radius: 8px !important;
@@ -129,7 +109,7 @@ st.markdown("""
     margin: 1.5rem 0 0.5rem 0; padding-bottom: 0.4rem;
     border-bottom: 1px solid #1e2130;
   }
-  code { font-family: 'DM Mono', monospace; background: #1a1d27; padding: 2px 6px; border-radius: 4px; }
+  code { background: #1a1d27; padding: 2px 6px; border-radius: 4px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -247,6 +227,90 @@ with st.sidebar:
 
 st.markdown("# 🔍 SKU Product Enrichment")
 st.markdown("Bulk enrich product codes with descriptions, specs and metadata — powered by Jina AI.")
+
+with st.expander("ℹ️ How this tool works", expanded=False):
+    st.markdown("""
+<style>
+  .help-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem 2rem; margin-top: 0.5rem; }
+  .help-card { background: #12141a; border: 1px solid #1e2130; border-radius: 8px; padding: 0.75rem 1rem; }
+  .help-card h4 { margin: 0 0 0.3rem 0; font-size: 0.8rem; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: #4f6ef7; }
+  .help-card p  { margin: 0; font-size: 0.82rem; color: #b0b4c8; line-height: 1.5; }
+  .help-card .tag { display: inline-block; font-size: 0.7rem; font-weight: 700; border-radius: 4px; padding: 1px 6px; margin-right: 4px; margin-top: 0.35rem; }
+  .pro  { background: rgba(79,180,115,0.15); color: #4fb473; }
+  .con  { background: rgba(230,80,80,0.15);  color: #e65050; }
+  .help-overview { font-size: 0.88rem; color: #b0b4c8; line-height: 1.6; margin-bottom: 0.75rem; }
+  .help-section-label { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: #4a4f6a; margin: 1rem 0 0.5rem 0; border-bottom: 1px solid #1e2130; padding-bottom: 0.3rem; }
+</style>
+
+<p class="help-overview">
+  This tool takes a list of product SKUs from a CSV or Excel file and automatically fetches product pages from the web via <strong>Jina AI Reader</strong>, then uses an <strong>LLM</strong> (OpenAI, Gemini, or Claude) to extract structured fields like name, brand, description, specs, and more. Results are available to download as CSV or Excel.
+</p>
+
+<div class="help-section-label">Pipeline overview</div>
+<div class="help-grid">
+  <div class="help-card">
+    <h4>1 · Search</h4>
+    <p>Jina AI searches Google for each SKU and returns the top product page URLs. The <em>Search Country</em> setting targets results to a specific region without adding country keywords to the query.</p>
+  </div>
+  <div class="help-card">
+    <h4>2 · Fetch &amp; Clean</h4>
+    <p>Each URL is fetched and stripped of navigation, footers, and boilerplate. The <em>Page return format</em> controls the shape of the cleaned content passed to the LLM.</p>
+  </div>
+  <div class="help-card">
+    <h4>3 · Extract</h4>
+    <p>The LLM reads the cleaned page content and extracts only the fields you selected. If the page contains <strong>JSON-LD structured data</strong>, that is passed as a trusted hint to improve accuracy.</p>
+  </div>
+  <div class="help-card">
+    <h4>4 · Review flags</h4>
+    <p>Results with low confidence are automatically flagged for manual review. The <em>Review Flag</em> field in the output marks these rows so you can spot-check them quickly.</p>
+  </div>
+</div>
+
+<div class="help-section-label">Advanced settings</div>
+<div class="help-grid">
+  <div class="help-card">
+    <h4>URLs per SKU</h4>
+    <p>How many product pages are fetched and cross-referenced per SKU. More pages improve accuracy on ambiguous SKUs but increase cost and runtime.</p>
+    <span class="tag pro">better accuracy</span><span class="tag con">higher cost and time</span>
+  </div>
+  <div class="help-card">
+    <h4>Concurrent workers</h4>
+    <p>Number of SKUs processed in parallel. Higher values finish large batches faster but increase the chance of hitting API rate limits on both Jina and your LLM provider.</p>
+    <span class="tag pro">faster batches</span><span class="tag con">higher rate limit risk</span>
+  </div>
+  <div class="help-card">
+    <h4>Max chars per page</h4>
+    <p>Truncation limit applied after cleaning. Lower values reduce LLM token usage and cost; higher values preserve more context for complex or long product pages.</p>
+    <span class="tag pro">lower cost at lower values</span><span class="tag con">lower accuracy if too small</span>
+  </div>
+  <div class="help-card">
+    <h4>Page return format</h4>
+    <p><em>Markdown</em> is the cleanest for LLM extraction and recommended for most cases. <em>Text</em> is plainer and slightly smaller. <em>HTML</em> preserves table structure but is verbose and uses more tokens.</p>
+    <span class="tag pro">markdown is best default</span><span class="tag con">html uses more tokens</span>
+  </div>
+  <div class="help-card">
+    <h4>Bypass Jina cache</h4>
+    <p>Forces Jina to re-fetch live pages rather than serve a cached copy. Useful when product pages have recently changed. Turn off to speed up repeated runs on the same SKU list.</p>
+    <span class="tag pro">always fresh data</span><span class="tag con">slower, more quota used</span>
+  </div>
+  <div class="help-card">
+    <h4>Retry if fewer than 2 results</h4>
+    <p>If the initial search returns only one URL, a second search is attempted with a varied query. Helps with obscure SKUs but adds latency per affected row.</p>
+    <span class="tag pro">better coverage</span><span class="tag con">slower for rare SKUs</span>
+  </div>
+  <div class="help-card">
+    <h4>Delay between fetches</h4>
+    <p>Pause in seconds between each individual URL fetch within a SKU. A small delay reduces the chance of Jina throttling your requests when processing many URLs per SKU.</p>
+    <span class="tag pro">reduces throttling</span><span class="tag con">increases per-SKU time</span>
+  </div>
+  <div class="help-card">
+    <h4>Delay between batches</h4>
+    <p>Pause between each concurrent worker batch. Gives both Jina and your LLM provider time to recover between bursts, especially useful for large jobs running overnight.</p>
+    <span class="tag pro">reduces rate limit risk</span><span class="tag con">increases total runtime</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
 st.divider()
 
 if st.session_state["rate_limit_hit"]:

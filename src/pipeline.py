@@ -37,9 +37,14 @@ def process_sku(
     output_fields: list,
     jina_cfg:      JinaConfig,
     llm_cfg:       LLMConfig,
+    extra_term:    str = "",
 ) -> SKUResult:
     """
     Process a single SKU end-to-end. Fully stateless — safe to call concurrently.
+
+    secondary_term is an optional value from a secondary column (e.g. product
+    name or brand). It is used as a standalone fallback search query if the
+    primary SKU search returns irrelevant results — the two are never combined.
 
     Flow:
       1. Fetch pages via Jina (search + content-cleaned fetch)
@@ -54,7 +59,7 @@ def process_sku(
 
     # 1. Fetch
     try:
-        pages, fetch_status = fetch_pages_for_sku(sku, jina_cfg)
+        pages, fetch_status = fetch_pages_for_sku(sku, jina_cfg, secondary_term=secondary_term)
     except RateLimitError as e:
         return SKUResult(sku=sku, status="rate_limited",
                          data=_empty_row(original_row, output_fields, "RATE_LIMITED"),
@@ -106,7 +111,8 @@ def process_batch(
     max_workers:   int = 5,
 ) -> list:
     """
-    Process a list of (sku, original_row) tuples concurrently.
+    Process a list of (sku, extra_term, original_row) tuples concurrently.
+    secondary_term may be an empty string when no secondary column is configured.
     Returns results in completion order.
     Called from the Streamlit main thread in fixed-size batches so the UI
     can update between batches without threading complications.
@@ -114,8 +120,8 @@ def process_batch(
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
-            executor.submit(process_sku, sku, row, output_fields, jina_cfg, llm_cfg): sku
-            for sku, row in items
+            executor.submit(process_sku, sku, row, output_fields, jina_cfg, llm_cfg, secondary_term): sku
+            for sku, secondary_term, row in items
         }
         for future in as_completed(future_map):
             try:

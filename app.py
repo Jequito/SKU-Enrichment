@@ -119,6 +119,17 @@ defaults = {
     "results":        [],
     "running":        False,
     "stop_flag":      False,
+    # Pause/stop use a queue-based approach (not a flag) so that Streamlit's
+    # ScriptControlException (thrown when a button is clicked mid-run) naturally
+    # preserves state. remaining_items is updated after EVERY batch so the queue
+    # always reflects exactly what is left, even if the thread is killed abruptly.
+    "paused":           False,
+    "remaining_items":  [],   # live queue updated after every batch
+    "resume_items":     [],   # snapshot taken at pause time for resume
+    "resume_total":     0,
+    "sku_column":       "",
+    "selected_fields":  [],
+    "run_export_fields": [],  # locked at job start — immune to post-run UI changes
     "input_rows":     [],
     "input_columns":  [],
     "fieldnames":     [],
@@ -131,6 +142,7 @@ for k, v in defaults.items():
         st.session_state[k] = v
 
 is_running = st.session_state["running"]
+is_paused  = st.session_state["paused"]
 
 # key_label must always be defined before it can be referenced anywhere
 # (including the "To start" caption which runs before sidebar provider selection)
@@ -266,6 +278,58 @@ with st.expander("ℹ️ How this tool works", expanded=False):
   </div>
 </div>
 
+<div class="help-section-label">Output fields</div>
+<div class="help-grid">
+  <div class="help-card">
+    <h4>Product Name</h4>
+    <p>The full product title as found on the source page. This is the canonical name used by the manufacturer or retailer, not cleaned or shortened.</p>
+  </div>
+  <div class="help-card">
+    <h4>Brand</h4>
+    <p>The manufacturer or brand name extracted from the page. Useful for normalising supplier data where brand is missing or inconsistent in your source file.</p>
+  </div>
+  <div class="help-card">
+    <h4>Short Description</h4>
+    <p>A concise 1–2 sentence summary of what the product is. Suitable for catalogue listings, search results, or anywhere space is limited.</p>
+  </div>
+  <div class="help-card">
+    <h4>Long Description</h4>
+    <p>A fuller marketing-style description, typically 3–5 sentences. Drawn from the product page copy and intended for product detail pages or data sheets.</p>
+  </div>
+  <div class="help-card">
+    <h4>Specifications</h4>
+    <p>Key technical attributes — dimensions, weight, power rating, materials, compatibility, and so on — extracted from spec tables or bullet lists on the page.</p>
+  </div>
+  <div class="help-card">
+    <h4>Category</h4>
+    <p>The product category or breadcrumb path inferred from the page (e.g. <em>Power Tools &gt; Drills &gt; Hammer Drills</em>). Useful for taxonomy mapping.</p>
+  </div>
+  <div class="help-card">
+    <h4>Model Number</h4>
+    <p>The manufacturer's own model or part number found on the page. This may differ from your input SKU — if it does, it is worth investigating before importing.</p>
+  </div>
+  <div class="help-card">
+    <h4>Barcode (EAN/UPC)</h4>
+    <p>The EAN-13 or UPC-A barcode if visible on the page. Not always present — retailers often omit it. Blank does not mean the product has no barcode.</p>
+  </div>
+  <div class="help-card">
+    <h4>Country of Origin</h4>
+    <p>Where the product is manufactured, if stated. Useful for compliance, import declarations, or supplier auditing.</p>
+  </div>
+  <div class="help-card">
+    <h4>Source URL</h4>
+    <p>The exact URL the data was extracted from. Always include this field if you plan to audit results or report back to a supplier — it gives you a direct link to the evidence.</p>
+  </div>
+  <div class="help-card">
+    <h4>Confidence Score</h4>
+    <p>A 0–100 score the LLM assigns based on how well the fetched page matched your SKU. Above 80 is generally reliable. Below 60 usually means the page was a poor match and the data should be verified manually.</p>
+  </div>
+  <div class="help-card">
+    <h4>Review Flag</h4>
+    <p>Set to <strong>True</strong> when the LLM's confidence is low, the model number on the page conflicts with your SKU, or the page content was ambiguous. Use this column to filter rows for manual checking before importing results into your system.</p>
+  </div>
+</div>
+
 <div class="help-section-label">Advanced settings</div>
 <div class="help-grid">
   <div class="help-card">
@@ -357,8 +421,26 @@ with col_config:
         sku_hints   = ["sku","product_code","code","part","model","item","mpn","id"]
         default_sku = next((i for i, c in enumerate(columns) if any(h in c.lower() for h in sku_hints)), 0)
         sku_column  = st.selectbox("SKU Column", columns, index=default_sku, disabled=is_running)
+
+        secondary_options = ["— none —"] + [c for c in columns if c != sku_column]
+        secondary_column  = st.selectbox(
+            "Secondary search term column",
+            secondary_options,
+            disabled=is_running,
+            help=(
+                "Optional. Values from this column are appended to the Jina search query "
+                "alongside the SKU — useful when SKUs are short or ambiguous (e.g. add a "
+                "product name or brand column to narrow results). Leave as none if your "
+                "SKUs are descriptive enough on their own."
+            ),
+        )
+        secondary_column = None if secondary_column == "— none —" else secondary_column
     else:
-        sku_column = st.selectbox("SKU Column", ["— upload a file first —"], disabled=True)
+        sku_column       = st.selectbox("SKU Column", ["— upload a file first —"], disabled=True)
+        secondary_column = None
+        st.selectbox("Secondary search term column", ["— upload a file first —"], disabled=True)
+
+    st.session_state["sku_column"] = sku_column
 
     st.markdown("**Fields to extract**")
     field_options = {
@@ -388,18 +470,28 @@ with col_config:
 # ── Controls ──────────────────────────────────────────────────────────────────
 
 st.divider()
-c1, c2, c3 = st.columns([2, 1, 1])
+c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
 
 can_start = bool(rows) and bool(llm_api_key) and bool(selected_fields) and sku_column != "— upload a file first —"
 
 with c1:
-    start_btn = st.button("▶  Start Enrichment", disabled=not can_start or is_running)
+    if is_paused:
+        start_btn  = st.button("▶  Resume", disabled=not can_start)
+    else:
+        start_btn  = st.button("▶  Start Enrichment", disabled=not can_start or is_running)
 with c2:
-    stop_btn  = st.button("⏹  Stop", disabled=not is_running)
+    pause_btn  = st.button("⏸  Pause",  disabled=not is_running)
 with c3:
-    clear_btn = st.button("🗑  Clear Results", disabled=is_running)
+    stop_btn   = st.button("⏹  Stop",   disabled=not is_running and not is_paused)
+with c4:
+    clear_btn  = st.button("🗑  Clear",  disabled=is_running)
 
-if not can_start and not is_running:
+if is_paused:
+    done_so_far = len(st.session_state["results"])
+    remaining   = len(st.session_state["resume_items"])
+    st.info(f"⏸ **Paused** — {done_so_far} SKUs done, {remaining} remaining. Adjust settings above if needed, then click Resume.")
+
+if not can_start and not is_running and not is_paused:
     missing = []
     if not rows:            missing.append("upload a file")
     if not llm_api_key:     missing.append(f"enter {key_label}")
@@ -407,25 +499,149 @@ if not can_start and not is_running:
     if missing:
         st.caption(f"⚠️  To start: {', '.join(missing)}")
 
+if pause_btn:
+    # Pause works by setting paused=True and running=False, then letting the
+    # next Streamlit rerun naturally stop the loop. remaining_items is already
+    # up-to-date because _run_pipeline writes it after every batch — so even
+    # if Streamlit kills the thread mid-loop via ScriptControlException, the
+    # queue correctly holds whatever was left at the end of the last completed
+    # batch. No flag-checking inside the loop is needed or reliable.
+    remaining = st.session_state.get("remaining_items", [])
+    st.session_state["paused"]       = True
+    st.session_state["running"]      = False
+    st.session_state["resume_items"] = remaining
+    st.rerun()
+
 if stop_btn:
-    st.session_state["stop_flag"] = True
+    st.session_state["running"]         = False
+    st.session_state["paused"]          = False
+    st.session_state["resume_items"]    = []
+    st.session_state["remaining_items"] = []
+    st.rerun()
 
 if clear_btn:
-    for k in ["results", "fieldnames"]:
+    for k in ["results", "fieldnames", "resume_items", "remaining_items", "run_export_fields"]:
         st.session_state[k] = []
     st.session_state["stats"]          = {"success": 0, "review": 0, "not_found": 0, "error": 0, "rate_limited": 0, "jsonld_hint": 0}
     st.session_state["rate_limit_hit"] = False
+    st.session_state["paused"]         = False
+    st.session_state["resume_total"]   = 0
     st.rerun()
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
-if start_btn:
+def _run_pipeline(work_items, total, fieldnames, jina_cfg, llm_cfg, max_workers, delay_between_skus):
+    """
+    Shared pipeline loop used by both fresh Start and Resume.
+
+    Pause/Stop safety model
+    -----------------------
+    We do NOT check a pause_flag or stop_flag inside this loop. Streamlit
+    button clicks throw a ScriptControlException that kills the running thread
+    instantly — any flag set by the user will never be seen by a mid-loop
+    check. Instead, we rely on the queue-based approach:
+
+      * remaining_items is written to session_state AFTER every completed
+        batch. If Streamlit kills the thread, the queue already holds exactly
+        what is left from the last completed batch.
+      * The Pause button handler reads remaining_items and copies it to
+        resume_items, then sets running=False and triggers a rerun.
+      * On the next page load, the loop simply does not start (running=False),
+        and the paused UI is shown with an accurate resume queue.
+
+    This means Pause always loses at most one in-flight batch (the one that
+    was executing when the button was clicked), which is unavoidable in any
+    synchronous Streamlit app and is clearly communicated to the user.
+    """
+    n_batches = math.ceil(len(work_items) / max_workers)
+    completed = len(st.session_state["results"])  # already done before this run
+
+    progress_bar = st.progress(0, text="Starting…")
+    status_box   = st.empty()
+    table_box    = st.empty()
+
+    for batch_idx in range(n_batches):
+        batch_start  = batch_idx * max_workers
+        batch_end    = min(batch_start + max_workers, len(work_items))
+        batch        = work_items[batch_start:batch_end]
+        global_done  = completed + batch_start
+
+        skus_label = ", ".join(s for s, _, __ in batch[:3])
+        if len(batch) > 3:
+            skus_label += f" +{len(batch)-3} more"
+        pct = global_done / max(total, 1)
+        progress_bar.progress(
+            pct,
+            text=f"Processing **{skus_label}** ({global_done + 1}–{global_done + len(batch)}/{total})"
+        )
+
+        batch_results = process_batch(batch, selected_fields, jina_cfg, llm_cfg, max_workers=max_workers)
+
+        rate_limited = False
+        for result in batch_results:
+            s = st.session_state["stats"]
+            if result.status == "success":
+                s["success"] += 1
+            elif result.status == "review":
+                s["review"] += 1
+            elif result.status == "rate_limited":
+                s["rate_limited"] += 1
+                st.session_state["rate_limit_hit"] = True
+                rate_limited = True
+                status_box.error(f"🚫 Rate limit hit on **{result.sku}**. Results so far are safe to download.")
+            elif result.status in ("not_found", "blocked"):
+                s["not_found"] += 1
+            else:
+                s["error"] += 1
+
+            if result.had_jsonld:
+                s["jsonld_hint"] += 1
+
+            st.session_state["results"].append(result.data)
+
+        # ── Update the queue AFTER every batch ──────────────────────────────
+        # This is the key safety write. If Streamlit kills the thread on the
+        # next button click, this value is already in session_state and the
+        # Pause/Stop handlers can read it without needing any flag.
+        st.session_state["remaining_items"] = work_items[batch_end:]
+
+        preview_df   = pd.DataFrame(st.session_state["results"][-20:])
+        preview_cols = [c for c in fieldnames if c in preview_df.columns]
+        table_box.dataframe(
+            preview_df[preview_cols] if preview_cols else preview_df,
+            use_container_width=True, height=280,
+        )
+
+        if rate_limited:
+            break
+
+        time.sleep(delay_between_skus)
+
+    done = len(st.session_state["results"])
+    all_done = (done - completed) >= len(work_items)
+    if all_done and not st.session_state.get("rate_limit_hit"):
+        progress_bar.progress(1.0, text="✅ Complete!")
+    else:
+        progress_bar.progress(done / max(total, 1), text=f"⏹ Stopped at {done}/{total} SKUs")
+
+    st.session_state["running"]         = False
+    st.session_state["paused"]          = False
+    st.session_state["resume_items"]    = []
+    st.session_state["remaining_items"] = []
+    st.rerun()
+
+
+if start_btn and not is_paused:
+    # Fresh start — reset everything
     st.session_state.update({
-        "running":        True,
-        "stop_flag":      False,
-        "results":        [],
-        "rate_limit_hit": False,
-        "stats":          {"success": 0, "review": 0, "not_found": 0, "error": 0, "rate_limited": 0, "jsonld_hint": 0},
+        "running":          True,
+        "stop_flag":        False,
+        "paused":           False,
+        "resume_items":     [],
+        "remaining_items":  [],
+        "results":          [],
+        "rate_limit_hit":   False,
+        "stats":            {"success": 0, "review": 0, "not_found": 0, "error": 0, "rate_limited": 0, "jsonld_hint": 0},
     })
 
     jina_cfg = JinaConfig(
@@ -438,81 +654,52 @@ if start_btn:
     llm_cfg = LLMConfig(provider=provider_key, api_key=llm_api_key, model=llm_model)
 
     fieldnames = build_fieldnames(columns, selected_fields)
-    st.session_state["fieldnames"] = fieldnames
+    st.session_state["fieldnames"]        = fieldnames
+    st.session_state["selected_fields"]   = selected_fields
+    # Lock the export config at start time so post-run UI changes (e.g. the
+    # user fiddling with the SKU column dropdown while viewing results) cannot
+    # corrupt the download with KeyErrors or mismatched columns.
+    st.session_state["run_export_fields"] = fieldnames
+    st.session_state["sku_column"]        = sku_column
 
-    # Build work items — filter empty SKUs
     work_items = [
-        (str(row.get(sku_column, "") or "").strip(), row)
+        (
+            str(row.get(sku_column, "") or "").strip(),
+            str(row.get(secondary_column, "") or "").strip() if secondary_column else "",
+            row,
+        )
         for row in rows
         if str(row.get(sku_column, "") or "").strip()
     ]
-    total      = len(work_items)
-    n_batches  = math.ceil(total / max_workers)
+    total = len(work_items)
+    st.session_state["resume_total"] = total
 
-    progress_bar = st.progress(0, text="Starting…")
-    status_box   = st.empty()
-    table_box    = st.empty()
+    _run_pipeline(work_items, total, fieldnames, jina_cfg, llm_cfg, max_workers, delay_between_skus)
 
-    for batch_idx in range(n_batches):
-        if st.session_state["stop_flag"]:
-            status_box.warning("⏹ Stopped by user.")
-            break
 
-        batch_start = batch_idx * max_workers
-        batch_end   = min(batch_start + max_workers, total)
-        batch       = work_items[batch_start:batch_end]
+if start_btn and is_paused:
+    # Resume from saved position
+    work_items = st.session_state["resume_items"]
+    total      = st.session_state["resume_total"]
+    fieldnames = st.session_state["fieldnames"]
 
-        # Label for progress bar
-        skus_label = ", ".join(s for s, _ in batch[:3])
-        if len(batch) > 3:
-            skus_label += f" +{len(batch)-3} more"
-        pct = batch_start / total
-        progress_bar.progress(pct, text=f"Batch {batch_idx+1}/{n_batches} — **{skus_label}** ({batch_start+1}–{batch_end}/{total})")
+    jina_cfg = JinaConfig(
+        api_key=jina_api_key, country_code=country_code,
+        urls_per_sku=urls_per_sku, max_chars=max_chars,
+        timeout=timeout, no_cache=no_cache,
+        return_format=return_format, retry_on_few=retry_on_few,
+        delay_between=delay_between,
+    )
+    llm_cfg = LLMConfig(provider=provider_key, api_key=llm_api_key, model=llm_model)
 
-        # Process batch concurrently
-        batch_results = process_batch(batch, selected_fields, jina_cfg, llm_cfg, max_workers=max_workers)
+    st.session_state.update({
+        "running":         True,
+        "paused":          False,
+        "stop_flag":       False,
+        "remaining_items": list(work_items),  # seed queue for this resume leg
+    })
 
-        # Update stats and results
-        for result in batch_results:
-            s = st.session_state["stats"]
-            if result.status == "success":
-                s["success"] += 1
-            elif result.status == "review":
-                s["review"] += 1
-            elif result.status == "rate_limited":
-                s["rate_limited"] += 1
-                st.session_state["rate_limit_hit"] = True
-                st.session_state["stop_flag"]      = True
-                status_box.error(f"🚫 Rate limit hit on **{result.sku}**. Results so far are safe to download.")
-            elif result.status in ("not_found", "blocked"):
-                s["not_found"] += 1
-            else:
-                s["error"] += 1
-
-            if result.had_jsonld:
-                s["jsonld_hint"] += 1
-
-            st.session_state["results"].append(result.data)
-
-        # Live preview
-        preview_df   = pd.DataFrame(st.session_state["results"][-20:])
-        preview_cols = [c for c in fieldnames if c in preview_df.columns]
-        table_box.dataframe(
-            preview_df[preview_cols] if preview_cols else preview_df,
-            use_container_width=True, height=280,
-        )
-
-        time.sleep(delay_between_skus)
-
-    if not st.session_state["stop_flag"]:
-        progress_bar.progress(1.0, text="✅ Complete!")
-    else:
-        progress_bar.progress(
-            len(st.session_state["results"]) / max(total, 1),
-            text=f"⏹ Stopped at {len(st.session_state['results'])}/{total} SKUs",
-        )
-    st.session_state["running"] = False
-    st.rerun()
+    _run_pipeline(work_items, total, fieldnames, jina_cfg, llm_cfg, max_workers, delay_between_skus)
 
 # ── Results ───────────────────────────────────────────────────────────────────
 
@@ -544,16 +731,58 @@ if st.session_state["results"]:
     st.dataframe(df[show_cols] if show_cols else df, use_container_width=True, height=400)
 
     st.markdown("### ⬇️ Download")
-    d1, d2, _ = st.columns([1, 1, 2])
-    all_rows  = st.session_state["results"]
 
+    # ── Export mode ──────────────────────────────────────────────────────────
+    export_mode = st.radio(
+        "Export format",
+        ["Combined — original columns + enriched fields",
+         "Enriched fields only — SKU + selected output fields"],
+        horizontal=True,
+        help=(
+            "Combined keeps all your original input columns and appends the enriched fields. "
+            "Enriched only outputs just the SKU column plus the fields you selected — "
+            "useful for importing into a separate system or joining back later."
+        ),
+    )
+
+    all_rows = st.session_state["results"]
+
+    # Use the field list that was locked at job-start time. This ensures that
+    # if the user changes the SKU column dropdown or unchecks a field while
+    # browsing results, the download is not corrupted with KeyErrors or
+    # mismatched columns from the live (post-run) UI state.
+    _locked_fields  = st.session_state.get("run_export_fields") or fieldnames
+    _locked_sku_col = st.session_state.get("sku_column", "")
+
+    if export_mode.startswith("Enriched"):
+        # SKU column first, then output fields only — no original input columns.
+        _enriched_cols = []
+        _seen = set()
+        for _c in ([_locked_sku_col] if _locked_sku_col else []) + list(_locked_fields):
+            if _c and _c not in _seen:
+                _enriched_cols.append(_c)
+                _seen.add(_c)
+        export_fieldnames = _enriched_cols or _locked_fields
+        export_label      = "enriched"
+    else:
+        export_fieldnames = _locked_fields
+        export_label      = "enriched_products"
+
+    d1, d2 = st.columns(2)
     with d1:
-        st.download_button("Download CSV",   data=to_csv_bytes(all_rows, fieldnames),
-                            file_name="enriched_products.csv",   mime="text/csv")
+        st.download_button(
+            "⬇️ Download CSV",
+            data=to_csv_bytes(all_rows, export_fieldnames),
+            file_name=f"{export_label}.csv",
+            mime="text/csv",
+        )
     with d2:
-        st.download_button("Download Excel", data=to_xlsx_bytes(all_rows, fieldnames),
-                            file_name="enriched_products.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button(
+            "⬇️ Download Excel",
+            data=to_xlsx_bytes(all_rows, export_fieldnames),
+            file_name=f"{export_label}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
 elif not is_running:
     st.markdown("""

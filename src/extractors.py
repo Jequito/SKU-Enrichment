@@ -101,14 +101,27 @@ JSON output for SKU "{sku}":"""
 
 
 def parse_json_response(text: str) -> dict:
+    """
+    Extract the first valid JSON object from LLM output.
+
+    Uses Python's raw JSON decoder to stop at the exact closing brace of the
+    first object — this correctly handles "chatty" models that append extra
+    text or a second JSON block after the primary response, both of which
+    would cause json.loads() to raise an 'Extra data' error if we naively
+    sliced from first { to last }.
+    """
     if not text:
         return {}
     text = text.replace("```json", "").replace("```", "").strip()
     try:
         start = text.index("{")
-        end   = text.rindex("}") + 1
-        return json.loads(text[start:end])
-    except (ValueError, json.JSONDecodeError):
+    except ValueError:
+        return {}
+    decoder = json.JSONDecoder()
+    try:
+        obj, _ = decoder.raw_decode(text, start)
+        return obj if isinstance(obj, dict) else {}
+    except json.JSONDecodeError:
         return {}
 
 

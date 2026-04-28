@@ -97,13 +97,71 @@ def search(query: str, cfg: JinaConfig) -> list[dict]:
         raise JinaError(f"Search failed: {e}")
 
 
-def search_for_sku(sku: str, cfg: JinaConfig) -> list[dict]:
-    results = search(f'"{sku}"', cfg)
-    if len(results) < 2 and cfg.retry_on_few:
-        fallback = search(f'"{sku}" specifications', cfg)
-        if len(fallback) > len(results):
-            results = fallback
-    return results
+# Minimum confidence threshold for SKU search results.
+# Results below this score are treated as a poor match and trigger a
+# secondary-term retry if one is configured.
+_LOW_CONFIDENCE_THRESHOLD = 0.4
+
+
+def _results_look_relevant(results: list[dict], sku: str) -> bool:
+    """
+    Heuristic: decide whether search results are good enough to proceed.
+    Returns False (triggering a secondary-term retry) when:
+      - No results were returned at all, OR
+      - The top result's URL/title doesn't contain the SKU and the average
+        score across all results is below our confidence threshold.
+    This catches the common case where a short or ambiguous SKU returns
+    completely unrelated pages before we waste a fetch on them.
+    """
+    if not results:
+        return False
+    sku_lower = sku.lower()
+    top = results[0]
+    top_url   = (top.get("url")   or "").lower()
+    top_title = (top.get("title") or "").lower()
+    sku_in_top = sku_lower in top_url or sku_lower in top_title
+    avg_score = sum(r.get("score", 0) for r in results) / len(results)
+    return sku_in_top or avg_score >= _LOW_CONFIDENCE_THRESHOLD
+
+
+def search_for_sku(sku: str, cfg: JinaConfig, secondary_term: str = "") -> list[dict]:
+    """
+    Search for a SKU using a two-stage fallback strategy.
+
+    Stage 1: Search with the exact SKU quoted (e.g. "ABC123").
+             If results look relevant, return them immediately.
+
+    Stage 2: Only if Stage 1 results look off (wrong product, low score,
+             no URL match), retry using the secondary_term as a standalone
+             query — NOT combined with the SKU. This handles the common case
+             where a short or manufacturer-internal SKU returns unrelated
+             pages, but the secondary column (e.g. a product name or brand)
+             produces much better results on its own.
+
+    The two queries are deliberately kept separate. Combining them (e.g.
+    "ABC123 Bosch Drill") typically yields no results because the SKU and
+    the name rarely co-occur verbatim on the same page.
+    """
+    sku_results = search(f'"{sku}"', cfg)
+
+    if _results_look_relevant(sku_results, sku):
+        # SKU search looks good — apply the existing retry-on-few logic
+        if len(sku_results) < 2 and cfg.retry_on_few:
+            fallback = search(f'"{sku}" specifications', cfg)
+            if len(fallback) > len(sku_results):
+                sku_results = fallback
+        return sku_results
+
+    # SKU search returned poor results — try the secondary term standalone
+    if secondary_term:
+        secondary_results = search(secondary_term, cfg)
+        if secondary_results:
+            return secondary_results
+
+    # No secondary term, or secondary also returned nothing — return whatever
+    # the SKU search gave us (even if weak) so the pipeline can still attempt
+    # extraction and flag the row for review.
+    return sku_results
 
 
 def score_url(result: dict) -> int:
@@ -176,13 +234,15 @@ def _fetch_direct(url: str, cfg: JinaConfig) -> str | None:
         return None
 
 
-def fetch_pages_for_sku(sku: str, cfg: JinaConfig) -> tuple[list[dict], str]:
+def fetch_pages_for_sku(sku: str, cfg: JinaConfig, secondary_term: str = "") -> tuple[list[dict], str]:
     """
     Full pipeline for one SKU: search → score → fetch → clean.
     Returns (pages, status) where pages = [{url, content}, ...].
+    secondary_term: value from the secondary column — used as a standalone
+    fallback query if the SKU search returns irrelevant results.
     """
     try:
-        results = search_for_sku(sku, cfg)
+        results = search_for_sku(sku, cfg, secondary_term=secondary_term)
     except RateLimitError:
         return [], "rate_limited"
     except Exception:

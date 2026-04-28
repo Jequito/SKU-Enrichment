@@ -16,7 +16,7 @@ from src.pipeline     import process_batch
 # ── Page config ───────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="SKU Enrichment",
+    page_title="SKU Product Enrichment",
     page_icon="🔍",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -45,6 +45,32 @@ st.markdown("""
     color: #e8e8e8 !important; font-family: 'DM Mono', monospace !important;
     border-radius: 6px !important;
   }
+
+  /* ── Sliders ── */
+  /* Track */
+  [data-testid="stSlider"] [data-baseweb="slider"] div[role="progressbar"] {
+    background: #4f6ef7 !important;
+  }
+  /* Thumb */
+  [data-testid="stSlider"] [data-baseweb="slider"] div[role="slider"] {
+    background: #4f6ef7 !important;
+    border-color: #4f6ef7 !important;
+    box-shadow: 0 0 0 4px rgba(79,110,247,0.2) !important;
+  }
+  /* Value label above thumb */
+  [data-testid="stSlider"] [data-testid="stThumbValue"] {
+    color: #4f6ef7 !important;
+    font-family: 'DM Mono', monospace !important;
+    font-size: 12px !important;
+  }
+  /* Min/max tick labels */
+  [data-testid="stSlider"] [data-testid="stTickBarMin"],
+  [data-testid="stSlider"] [data-testid="stTickBarMax"] {
+    color: #4a4f6a !important;
+    font-family: 'DM Mono', monospace !important;
+  }
+
+  /* ── Buttons ── */
   .stButton > button {
     background: linear-gradient(135deg, #4f6ef7, #7c4ff7);
     color: white; border: none; border-radius: 8px;
@@ -62,12 +88,36 @@ st.markdown("""
   }
   .stDownloadButton > button:hover { background: #4f6ef7; color: white; }
 
+  /* ── Metrics ── */
   [data-testid="stMetric"] { background: #1a1d27; border: 1px solid #2a2d3e; border-radius: 10px; padding: 1rem; }
   [data-testid="stMetricValue"] { font-family: 'DM Mono', monospace; font-size: 1.8rem !important; color: #4f6ef7; }
+
+  /* ── Progress bar ── */
   .stProgress > div > div { background: linear-gradient(90deg, #4f6ef7, #7c4ff7); border-radius: 4px; }
   hr { border-color: #1e2130; }
-  .streamlit-expanderHeader { background: #1a1d27 !important; border-radius: 6px !important; color: #e8e8e8 !important; }
 
+  /* ── Expander — use current Streamlit testid selectors, not deprecated class names ── */
+  [data-testid="stExpander"] {
+    background: #1a1d27 !important;
+    border: 1px solid #2a2d3e !important;
+    border-radius: 8px !important;
+  }
+  [data-testid="stExpander"] summary {
+    color: #e8e8e8 !important;
+    font-family: 'Syne', sans-serif !important;
+    font-weight: 600 !important;
+    padding: 0.6rem 0.8rem !important;
+    border-radius: 8px !important;
+  }
+  [data-testid="stExpander"] summary:hover {
+    background: #20243a !important;
+  }
+  /* Suppress any text artifact from the toggle icon */
+  [data-testid="stExpanderToggleIcon"] {
+    color: #4f6ef7 !important;
+  }
+
+  /* ── Sidebar section labels ── */
   .sidebar-section {
     font-size: 10px; font-weight: 700; letter-spacing: 0.12em;
     text-transform: uppercase; color: #4f6ef7;
@@ -97,9 +147,15 @@ for k, v in defaults.items():
 
 is_running = st.session_state["running"]
 
+# key_label must always be defined before it can be referenced anywhere
+# (including the "To start" caption which runs before sidebar provider selection)
+key_label = "API Key"
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
+    st.markdown("## 🔍 SKU Enrichment")
+    st.markdown("---")
     st.markdown("## ⚙️ Configuration")
     if is_running:
         st.warning("⏳ Job running — settings locked", icon="🔒")

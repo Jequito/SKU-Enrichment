@@ -98,19 +98,25 @@ PRODUCT IDENTIFIERS:
 {_identifier_block(ids)}
 
 RULES:
-- DO NOT return a fully empty result. Even if the page looks like a different
-  product variant, is in a non-English language, or only partially matches the
-  identifiers, extract whatever fields you reasonably can and set review_flag
-  to REVIEW_NEEDED so the user can verify manually.
+- ABSOLUTELY DO NOT return a fully empty result. If ANY source page provides
+  ANY information about a product — even a different variant, a different
+  language, or a partial match — extract that information and set
+  review_flag=REVIEW_NEEDED. The user will manually verify whether it's the
+  right product. Returning empty is worse than returning REVIEW_NEEDED data
+  because the user cannot verify what they cannot see.
+- Minimum required fields when source pages are provided: product_name (from
+  page title or H1 if nothing else), source_url, review_flag. Never leave
+  these three empty if you have any source content.
 - If the page content is in a non-English language, translate description
-  fields (short_description, long_description) into English. Keep the original
-  product name as-is.
-- Verify the source pages describe the same product as the identifiers above.
-  Match on the primary or fallback identifier appearing in the page content
-  to determine confidence. A non-match means REVIEW_NEEDED, not empty output.
+  fields (short_description, long_description) into clear English. Keep the
+  product name as-is from the page.
+- Match the primary or fallback identifier against the page content to
+  determine confidence. A clean match → review_flag=VERIFIED.
+  A partial/uncertain match → review_flag=REVIEW_NEEDED with extracted data.
+  No match at all → still extract what's there, review_flag=REVIEW_NEEDED.
 - Only extract values explicitly present in the sources or trusted metadata —
-  never invent data.
-- If an individual field is not found, return empty string "" for that field.
+  never invent data. But page metadata (title, meta description) IS valid
+  source data; use it.
 - For specifications use pipe format: "Width: 60cm | Power: 7.4kW | Colour: Black"
 - If values conflict across sources, include both and set review_flag to REVIEW_NEEDED.
 - ALWAYS populate source_url with the URL of the page that provided the most
@@ -273,5 +279,34 @@ def extract(
     for f in all_fields:
         if f not in result:
             result[f] = ""
+
+    # Safety net: if the LLM bailed and returned everything empty despite us
+    # providing source pages, populate the bare minimum so the row isn't
+    # useless to the user. This handles cases where some LLMs refuse to
+    # extract data when they suspect a product mismatch — even with explicit
+    # prompt instructions, Gemini in particular is prone to this.
+    important = ("product_name", "brand", "short_description", "long_description",
+                 "specifications", "category", "model_number")
+    has_any = any(str(result.get(f, "") or "").strip() for f in important)
+
+    if not has_any and pages:
+        # First fallback: borrow from JSON-LD hint if it exists
+        if jsonld_hint:
+            for f, v in jsonld_hint.items():
+                if f in all_fields and not result.get(f):
+                    result[f] = v
+            has_any = any(str(result.get(f, "") or "").strip() for f in important)
+
+        # Always populate source_url and flag for review — even if everything
+        # else is still empty, the user gets a URL to manually check
+        if not result.get("source_url"):
+            result["source_url"] = pages[0]["url"]
+
+        existing_flag = str(result.get("review_flag", "") or "").upper()
+        if "ERROR" not in existing_flag:
+            result["review_flag"] = "REVIEW_NEEDED"
+
+        if not result.get("confidence_score"):
+            result["confidence_score"] = "Low"
 
     return result

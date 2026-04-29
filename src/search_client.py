@@ -294,13 +294,32 @@ def fetch_page(url: str, cfg: SearchConfig) -> dict:
 
     jsonld = extract_jsonld(html)
 
-    # Two-pass extraction. Precision mode is the right default for product
-    # pages — it drops more boilerplate (nav, related products, FAQs) and
-    # gives the LLM a cleaner signal. But on awkwardly-structured pages it
-    # sometimes drops too much and we'd otherwise mark the row BLOCKED.
+    # Pull page metadata (title, meta description, og:description, etc.) up
+    # front. On Shopify, e-commerce platforms and many manufacturer sites the
+    # meta description has solid product copy that trafilatura's body
+    # extractor misses because it classifies the description container as
+    # boilerplate. Combining metadata with body extraction gives the LLM more
+    # to work with on these pages.
+    meta_lines: list[str] = []
+    try:
+        meta = trafilatura.extract_metadata(html)
+        if meta is not None:
+            t = getattr(meta, "title", None)
+            d = getattr(meta, "description", None)
+            s = getattr(meta, "sitename", None)
+            if t: meta_lines.append(f"PAGE TITLE: {t}")
+            if d: meta_lines.append(f"META DESCRIPTION: {d}")
+            if s: meta_lines.append(f"SITE: {s}")
+    except Exception:
+        pass
+
+    # Two-pass body extraction. Precision mode is the right default for
+    # product pages — it drops more boilerplate (nav, related products, FAQs)
+    # and gives the LLM a cleaner signal. But on awkwardly-structured pages
+    # it sometimes drops too much and we'd otherwise mark the row BLOCKED.
     # When that happens, retry with recall mode which keeps more text and
     # rescues the page. No extra network cost — same HTML, second parse.
-    extracted = trafilatura.extract(
+    body = trafilatura.extract(
         html,
         include_links=False,
         include_tables=True,
@@ -310,8 +329,8 @@ def fetch_page(url: str, cfg: SearchConfig) -> dict:
     )
 
     used_recall = False
-    if not extracted or len(extracted) < 200:
-        recall_extracted = trafilatura.extract(
+    if not body or len(body) < 200:
+        recall_body = trafilatura.extract(
             html,
             include_links=False,
             include_tables=True,
@@ -319,15 +338,28 @@ def fetch_page(url: str, cfg: SearchConfig) -> dict:
             output_format="markdown",
             favor_recall=True,
         )
-        if recall_extracted and len(recall_extracted) >= 200:
-            extracted = recall_extracted
+        if recall_body and len(recall_body) >= 200:
+            body = recall_body
             used_recall = True
 
-    if not extracted or len(extracted) < 200:
+    # Combine metadata header + body. Metadata alone is often enough on
+    # SPA pages where the body extraction returns nothing useful.
+    parts = []
+    if meta_lines:
+        parts.append("\n".join(meta_lines))
+    if body:
+        parts.append(body)
+    extracted = "\n\n".join(parts) if parts else ""
+
+    # Threshold check: 150 chars total across metadata + body. Pages with
+    # genuinely no content (failed JS, blank pages) won't clear this floor
+    # even with metadata, but pages with just title + meta description (a
+    # typical SPA with server-rendered meta tags) WILL pass through.
+    if not extracted or len(extracted) < 150:
         return {
             "ok": False,
-            "error": f"Extracted only {len(extracted or '')} chars after cleaning "
-                     "(JS-only page, login wall, or anti-bot — both precision and recall passes failed)",
+            "error": f"Extracted only {len(extracted)} chars after cleaning "
+                     "(JS-only page, login wall, anti-bot, or page genuinely empty)",
         }
 
     if len(extracted) > cfg.max_chars:
@@ -416,12 +448,29 @@ def fetch_pages_for_product(
     return pages, "ok", query, fetch_errors
 
 
+def _normalise_for_match(s: str) -> str:
+    """
+    Strip non-alphanumeric characters and lowercase. Used to make identifier
+    matching tolerant of formatting differences — so 'LDS-MAUI5' in the
+    user's data matches against page content containing 'LDS-MAUI-5-W-SUB'
+    (both normalise to 'ldsmaui5' / 'ldsmaui5wsub' where the first is a
+    substring of the second).
+    """
+    return "".join(c for c in s.lower() if c.isalnum())
+
+
 def content_validates_product(content: str, ids: IdentifierSet) -> bool:
-    """Sanity check: does primary or fallback value appear in the fetched page?"""
+    """Sanity check: does primary or fallback value appear in the fetched page?
+
+    Uses normalised matching so 'LDS-MAUI5' matches 'LDS-MAUI-5-W-SUB' and
+    'AAF7075' matches 'AAF7075-00'. Without this, legitimate product pages
+    were being flagged as non-validating purely because of hyphen/space
+    formatting differences.
+    """
     codes = ids.codes()
     if not codes:
         return True
     if not content:
         return False
-    lower = content.lower()
-    return any(c.lower() in lower for c in codes if c)
+    norm_content = _normalise_for_match(content)
+    return any(_normalise_for_match(c) in norm_content for c in codes if c)

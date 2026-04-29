@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from .search_client import (
     SearchConfig, IdentifierSet,
     fetch_pages_for_product, content_validates_product,
-    RateLimitError,
+    RateLimitError, BackendConfigError,
 )
 from .extractors import LLMConfig, extract
 
@@ -117,14 +117,28 @@ def process_product(
         if "ERROR" not in existing:
             extracted["review_flag"] = "REVIEW_NEEDED"
 
+    # Capture the LLM-side error (if any) before stripping it from the row so
+    # it doesn't leak into CSV/Excel exports. The extract() function catches
+    # provider exceptions internally and returns {review_flag: "ERROR",
+    # _error: "..."} — the previous version threw away that error message
+    # AND counted these rows as success because "REVIEW" wasn't in "ERROR".
+    llm_error = str(extracted.pop("_error", "") or "")
+
+    flag = str(extracted.get("review_flag", "") or "").upper()
+    if "ERROR" in flag:
+        status = "error"
+    elif "REVIEW" in flag:
+        status = "review"
+    else:
+        status = "success"
+
     enriched = {**original_row, **extracted}
-    flag     = str(extracted.get("review_flag", "") or "").upper()
-    status   = "review" if "REVIEW" in flag else "success"
 
     return SKUResult(
         sku=sku_label, status=status,
         data=enriched, sources=sources,
         had_jsonld=(jsonld_hint is not None),
+        error_msg=llm_error,
         debug_pages=debug_pages,
         jsonld_hint=jsonld_hint or {},
         query_used=query_used,

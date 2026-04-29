@@ -42,10 +42,8 @@ SYSTEM_PROMPT = (
 def _identifier_block(ids) -> str:
     """Render IdentifierSet as a labelled block for the prompt."""
     parts = []
-    if ids.sku:               parts.append(f"  SKU (internal):       {ids.sku}")
-    if ids.manufacturer_code: parts.append(f"  Manufacturer code:    {ids.manufacturer_code}")
-    if ids.brand:             parts.append(f"  Brand:                {ids.brand}")
-    if ids.product_name:      parts.append(f"  Product name (hint):  {ids.product_name}")
+    if ids.primary:  parts.append(f"  Primary identifier:   {ids.primary}")
+    if ids.fallback: parts.append(f"  Fallback identifier:  {ids.fallback}")
     return "\n".join(parts) if parts else "  (none provided)"
 
 
@@ -101,8 +99,9 @@ PRODUCT IDENTIFIERS:
 
 RULES:
 - Verify the source pages describe the SAME product as the identifiers above.
-  Match on SKU or Manufacturer code appearing in the page content. If the page
-  appears to describe a different product, set review_flag to REVIEW_NEEDED.
+  Match on the primary or fallback identifier appearing in the page content.
+  If the page appears to describe a different product, set review_flag to
+  REVIEW_NEEDED.
 - Only extract values explicitly present in the sources or trusted metadata —
   never invent data.
 - If a field is not found anywhere, return empty string "".
@@ -146,10 +145,13 @@ def parse_json_response(text: str) -> dict:
 # ── OpenAI ────────────────────────────────────────────────────────────────────
 
 OPENAI_MODELS = [
+    # Current GPT-5 family (April 2026 — see developers.openai.com/api/docs/models)
+    "gpt-5.4-mini",   # cheap + fast, recommended for batch extraction
+    "gpt-5.4-nano",   # cheapest, lower quality
+    "gpt-5.5",        # flagship — only use for hard SKUs
+    # Legacy — still in API as of April 2026 but deprecated in ChatGPT
     "gpt-4o-mini",
-    "gpt-4o",
-    "gpt-4-turbo",
-    "gpt-3.5-turbo",
+    "gpt-4.1-mini",
 ]
 
 def extract_openai(ids, pages, fields, api_key, model, jsonld_hint=None, max_chars=0):
@@ -172,9 +174,9 @@ def extract_openai(ids, pages, fields, api_key, model, jsonld_hint=None, max_cha
 # ── Gemini ────────────────────────────────────────────────────────────────────
 
 GEMINI_MODELS = [
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
+    "gemini-2.5-flash",   # current cheap+fast — recommended default
+    "gemini-2.5-pro",     # higher quality, more expensive
+    "gemini-2.0-flash",   # legacy fallback
 ]
 
 def extract_gemini(ids, pages, fields, api_key, model, jsonld_hint=None, max_chars=0):
@@ -203,9 +205,11 @@ def extract_gemini(ids, pages, fields, api_key, model, jsonld_hint=None, max_cha
 # ── Claude ────────────────────────────────────────────────────────────────────
 
 CLAUDE_MODELS = [
-    "claude-haiku-4-5-20251001",
-    "claude-sonnet-4-5",
-    "claude-opus-4-5",
+    # Current valid API model strings (April 2026 — see Anthropic models docs)
+    "claude-haiku-4-5-20251001",   # cheapest — recommended for batch
+    "claude-sonnet-4-6",           # default-quality balance
+    "claude-opus-4-7",             # latest flagship — only for hard SKUs
+    "claude-opus-4-6",             # previous flagship
 ]
 
 def extract_claude(ids, pages, fields, api_key, model, jsonld_hint=None, max_chars=0):

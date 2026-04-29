@@ -13,7 +13,7 @@ import time
 import streamlit as st
 import pandas as pd
 
-from src.search_client import SearchConfig, IdentifierSet, DDG_REGIONS
+from src.search_client import SearchConfig, IdentifierSet, SERPAPI_COUNTRIES, COUNTRY_LABELS
 from src.extractors    import LLMConfig, OPENAI_MODELS, GEMINI_MODELS, CLAUDE_MODELS
 from src.file_handler  import read_file, to_csv_bytes, to_xlsx_bytes, build_fieldnames
 from src.pipeline      import process_batch
@@ -125,6 +125,7 @@ defaults = {
     "run_export_fields": [],
     "sku_column":      "",
     "debug_log":       [],
+    "error_log":       [],   # [{sku, error}, ...] across the whole run
     "stats":           {"success": 0, "review": 0, "not_found": 0,
                         "error": 0, "rate_limited": 0, "jsonld_hint": 0},
     "rate_limit_hit":  False,
@@ -164,30 +165,36 @@ with st.sidebar:
     llm_model   = st.selectbox("Model", model_list, disabled=is_running)
 
     # ── Search ──
-    st.markdown('<div class="sidebar-section">Search & Fetch</div>', unsafe_allow_html=True)
-    st.caption("Search via DuckDuckGo (no key). Fetch via httpx + trafilatura.")
+    st.markdown('<div class="sidebar-section">SerpAPI Search</div>', unsafe_allow_html=True)
+
+    serpapi_api_key = st.text_input(
+        "SerpAPI Key", type="password", disabled=is_running,
+        help="Get a key at serpapi.com/manage-api-key. Free tier is 100 searches/month.",
+    )
+    st.caption(
+        "💰 SerpAPI free tier: **100 searches/month** (~50 SKUs). "
+        "Paid plans start at **$75/month** for 5,000 searches (~2,500 SKUs). "
+        "Each row uses 1 query when the primary column finds a match, 2 when it falls back."
+    )
 
     country_code = st.selectbox(
         "Search Region",
-        options=list(DDG_REGIONS.keys()), index=0, disabled=is_running,
-        format_func=lambda c: {"AU":"🇦🇺  Australia","US":"🇺🇸  United States",
-            "UK":"🇬🇧  United Kingdom","NZ":"🇳🇿  New Zealand","CA":"🇨🇦  Canada",
-            "DE":"🇩🇪  Germany","FR":"🇫🇷  France","JP":"🇯🇵  Japan",
-            "SG":"🇸🇬  Singapore","IN":"🇮🇳  India"}.get(c, c),
-        help="Region targeting passed to DuckDuckGo — biases results to that locale.",
+        options=list(SERPAPI_COUNTRIES.keys()), index=0, disabled=is_running,
+        format_func=lambda c: COUNTRY_LABELS.get(c, c),
+        help="Passed to Google as the gl parameter — biases results to that locale.",
     )
 
     urls_per_sku = st.slider("URLs per product", 1, 5, 2, disabled=is_running,
-                              help="Number of top-scored URLs to fetch per product")
+                              help="Number of top-scored URLs to fetch and pass to the LLM. With exact-match Google searches the top hit is usually correct — 1 is often enough.")
 
     with st.expander("Advanced fetch settings"):
         max_chars = st.slider("Max chars per page", 2000, 12000, 4000, step=500,
                                disabled=is_running,
                                help="Trafilatura output is truncated at this size before going to the LLM")
         timeout = st.slider("Request timeout (seconds)", 10, 60, 25, disabled=is_running,
-                             help="Applied to both DDG searches and httpx page fetches")
-        max_results = st.slider("DDG results per search", 5, 25, 10, disabled=is_running,
-                                 help="More results = better coverage, but slower per cascade stage")
+                             help="Applied to SerpAPI calls and page fetches")
+        max_results = st.slider("Google results per search", 5, 25, 10, disabled=is_running,
+                                 help="Number of organic results to consider before scoring and picking the top URLs to fetch")
         delay_between = st.slider("Delay between fetches (s)", 0.0, 3.0, 0.5, step=0.25,
                                    disabled=is_running,
                                    help="Pause between page fetches within a single product")
@@ -199,14 +206,14 @@ with st.sidebar:
         "Concurrent workers", 1, 20, 5, disabled=is_running,
         help=(
             "Products processed in parallel per batch. "
-            "DuckDuckGo throttles aggressively — 3–5 is the sweet spot. "
-            "Above 8 you'll likely see rate-limit errors."
+            "SerpAPI free tier handles ~5 concurrent. Paid plans go higher. "
+            "Above the plan's per-second limit you'll see 429s."
         ),
     )
 
     delay_between_skus = st.slider(
         "Delay between batches (s)", 0, 10, 1, disabled=is_running,
-        help="Pause between concurrent batches — helps avoid DDG rate limits",
+        help="Pause between concurrent batches — useful on free-tier SerpAPI",
     )
 
     st.divider()
@@ -233,35 +240,34 @@ with st.sidebar:
 # ── Main area ─────────────────────────────────────────────────────────────────
 
 st.markdown("# 🔍 SKU Product Enrichment")
-st.markdown("Bulk enrich product codes with descriptions, specs and metadata — DuckDuckGo search, no API keys required.")
+st.markdown("Bulk enrich product codes with descriptions, specs and metadata — Google search via SerpAPI.")
 
 with st.expander("ℹ️ How this tool works", expanded=False):
     st.markdown("""
-This tool takes a list of products from a CSV or Excel file and looks each one
-up via **DuckDuckGo** (no API key needed). It fetches the top product pages
-directly with `httpx`, extracts clean content with `trafilatura`, and uses an
-**LLM** (OpenAI, Gemini, or Claude) to extract structured fields. Results are
+This tool takes a list of products from a CSV or Excel file and looks each
+one up on **Google via SerpAPI**. It fetches the top product pages with
+`httpx`, extracts clean content with `trafilatura`, and uses an **LLM**
+(OpenAI, Gemini, or Claude) to extract structured fields. Results are
 downloadable as CSV or Excel.
 
-#### Cascade search
+#### Two-column exact-match search
 
-For each row, the tool tries up to five queries in order, stopping at the first
-one that returns results matching your identifier codes:
+For each row, the tool runs an exact-quoted Google search on your **Primary**
+column. If that returns zero results, it retries on your **Fallback** column.
+That's it — no wide-net fallback queries that risk pulling in pages about
+different products.
 
-1. `"{Manufacturer Code}"` quoted
-2. `"{SKU}"` quoted
-3. `"{Manufacturer Code}" {Brand}`
-4. `"{SKU}" {Brand}`
-5. `{Product Name} {Brand}` — wide net, last resort
-
-Map any combination of those columns from your file. SKU is the only required
-one — the others are optional but improve results when populated.
+| Outcome | SerpAPI queries used |
+|---|---|
+| Primary search finds something | 1 |
+| Primary returns nothing, fallback finds something | 2 |
+| Both return nothing | 1 (only the primary is charged; empty results are free) |
 
 #### Validation
 
-When pages are fetched, the tool checks that your SKU or Manufacturer code
+When pages are fetched, the tool checks that the Primary or Fallback value
 appears in the page content. If neither does, the row is flagged
-`REVIEW_NEEDED` because the page may describe a different product.
+`REVIEW_NEEDED` because Google may have surfaced a different product.
 
 #### JSON-LD hints
 
@@ -273,7 +279,7 @@ significantly more accurate results on retailer and manufacturer sites.
 st.divider()
 
 if st.session_state["rate_limit_hit"]:
-    st.error("⚠️ **DuckDuckGo rate limit hit.** Reduce concurrent workers and delay between batches, then click Resume. Results so far are safe to download.", icon="🚫")
+    st.error("⚠️ **SerpAPI rate limit or quota hit.** Wait, then click Resume. Results so far are safe to download.", icon="🚫")
 
 # ── Upload & config ───────────────────────────────────────────────────────────
 
@@ -311,70 +317,45 @@ with col_upload:
 
 with col_config:
     st.markdown("### 🏷️ Identifier Columns")
-    st.caption("Map any combination — SKU is required, the rest improve cascade matching.")
-
-    NONE_LABEL = "— none —"
+    st.caption("Map both columns. Primary is searched first, Fallback only runs if the primary search returns nothing.")
 
     if columns:
-        # Auto-detect column hints
-        sku_hints  = ["sku","product_code","code","item","id"]
-        mpn_hints  = ["mpn","model","manufacturer","mfr","part_no","part_number"]
-        brand_hints = ["brand","make","manufacturer_name","supplier"]
-        name_hints  = ["name","title","description","product_name"]
+        # Auto-detect: manufacturer/product code typically goes in Primary,
+        # internal SKU in Fallback. User can flip either dropdown.
+        primary_hints  = ["product_code","mpn","model","manufacturer","mfr","part_no","part_number"]
+        fallback_hints = ["sku","item","id","code"]
 
-        def _auto_index(opts, hints, offset=0):
+        def _auto_index(opts, hints):
             for i, c in enumerate(opts):
                 if any(h in str(c).lower() for h in hints):
-                    return i + offset
+                    return i
             return 0
 
-        sku_column = st.selectbox(
-            "SKU Column (required)",
+        primary_column = st.selectbox(
+            "Primary search column (required)",
             columns,
-            index=_auto_index(columns, sku_hints),
+            index=_auto_index(columns, primary_hints),
             disabled=is_running,
-            help="Your internal/branded code. Always used in the cascade.",
+            help="Searched first as an exact-quoted Google query. Typically your Product Code / MPN.",
         )
 
-        opts_with_none = [NONE_LABEL] + [c for c in columns if c != sku_column]
-
-        mfr_column = st.selectbox(
-            "Manufacturer Code Column",
-            opts_with_none,
-            index=_auto_index(opts_with_none, mpn_hints, offset=0),
+        fallback_options = [c for c in columns if c != primary_column]
+        fallback_column = st.selectbox(
+            "Fallback search column (required)",
+            fallback_options,
+            index=_auto_index(fallback_options, fallback_hints),
             disabled=is_running,
-            help="The manufacturer's own MPN/model number. Used as the strongest signal first.",
+            help="Searched only if the primary returns zero results. Typically your internal SKU.",
         )
-
-        brand_column = st.selectbox(
-            "Brand Column",
-            opts_with_none,
-            index=_auto_index(opts_with_none, brand_hints, offset=0),
-            disabled=is_running,
-            help="Brand name — combined with codes when bare-code searches return weak results.",
-        )
-
-        name_column = st.selectbox(
-            "Product Name / Description Column",
-            opts_with_none,
-            index=_auto_index(opts_with_none, name_hints, offset=0),
-            disabled=is_running,
-            help="Free-text product name — used as the last-resort wide search.",
-        )
-
-        mfr_column   = None if mfr_column   == NONE_LABEL else mfr_column
-        brand_column = None if brand_column == NONE_LABEL else brand_column
-        name_column  = None if name_column  == NONE_LABEL else name_column
     else:
-        sku_column   = st.selectbox("SKU Column (required)", ["— upload a file first —"], disabled=True)
-        mfr_column   = None
-        brand_column = None
-        name_column  = None
-        st.selectbox("Manufacturer Code Column", ["— upload a file first —"], disabled=True)
-        st.selectbox("Brand Column", ["— upload a file first —"], disabled=True)
-        st.selectbox("Product Name / Description Column", ["— upload a file first —"], disabled=True)
+        primary_column  = "— upload a file first —"
+        fallback_column = "— upload a file first —"
+        st.selectbox("Primary search column (required)",  ["— upload a file first —"], disabled=True)
+        st.selectbox("Fallback search column (required)", ["— upload a file first —"], disabled=True)
 
-    st.session_state["sku_column"] = sku_column
+    # The download/export logic uses sku_column as the row label — point it at
+    # the primary column so the existing export plumbing keeps working unchanged.
+    st.session_state["sku_column"] = primary_column
 
     st.markdown("**Fields to extract**")
     field_options = {
@@ -406,8 +387,12 @@ with col_config:
 st.divider()
 c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
 
-valid_sku_col = bool(columns) and sku_column != "— upload a file first —"
-can_start = bool(rows) and bool(llm_api_key) and bool(selected_fields) and valid_sku_col
+valid_columns = bool(columns) and primary_column != "— upload a file first —" and fallback_column != "— upload a file first —"
+
+can_start = (
+    bool(rows) and bool(llm_api_key) and bool(selected_fields)
+    and valid_columns and bool(serpapi_api_key)
+)
 
 with c1:
     if is_paused:
@@ -428,9 +413,11 @@ if is_paused:
 
 if not can_start and not is_running and not is_paused:
     missing = []
-    if not rows:                   missing.append("upload a file")
-    if not llm_api_key:            missing.append(f"enter {key_label}")
-    if not selected_fields:        missing.append("select at least one field")
+    if not rows:               missing.append("upload a file")
+    if not llm_api_key:        missing.append(f"enter {key_label}")
+    if not serpapi_api_key:    missing.append("enter SerpAPI key")
+    if not selected_fields:    missing.append("select at least one field")
+    if not valid_columns:      missing.append("map both Primary and Fallback columns")
     if missing:
         st.caption(f"⚠️  To start: {', '.join(missing)}")
 
@@ -452,7 +439,7 @@ if stop_btn:
     st.rerun()
 
 if clear_btn:
-    for k in ("results", "fieldnames", "work_queue", "run_export_fields", "debug_log"):
+    for k in ("results", "fieldnames", "work_queue", "run_export_fields", "debug_log", "error_log"):
         st.session_state[k] = []
     st.session_state["stats"] = {"success": 0, "review": 0, "not_found": 0,
                                   "error": 0, "rate_limited": 0, "jsonld_hint": 0}
@@ -469,10 +456,8 @@ if start_btn and not is_paused:
     work_items = []
     for row in rows:
         ids = IdentifierSet(
-            sku               = str(row.get(sku_column, "") or "").strip(),
-            manufacturer_code = str(row.get(mfr_column, "") or "").strip()   if mfr_column   else "",
-            brand             = str(row.get(brand_column, "") or "").strip() if brand_column else "",
-            product_name      = str(row.get(name_column, "") or "").strip()  if name_column  else "",
+            primary  = str(row.get(primary_column, "")  or "").strip(),
+            fallback = str(row.get(fallback_column, "") or "").strip(),
         )
         if not ids.is_empty():
             work_items.append((ids, row))
@@ -487,13 +472,14 @@ if start_btn and not is_paused:
         "completed_count":   0,
         "results":           [],
         "debug_log":         [],
+        "error_log":         [],
         "rate_limit_hit":    False,
         "stats":             {"success": 0, "review": 0, "not_found": 0,
                               "error": 0, "rate_limited": 0, "jsonld_hint": 0},
         "fieldnames":        fieldnames,
         "selected_fields":   selected_fields,
         "run_export_fields": fieldnames,
-        "sku_column":        sku_column,
+        "sku_column":        primary_column,
     })
     st.rerun()
 
@@ -516,12 +502,13 @@ if start_btn and is_paused:
 
 if is_running and st.session_state["work_queue"]:
     search_cfg = SearchConfig(
-        country_code  = country_code,
-        urls_per_sku  = urls_per_sku,
-        max_chars     = max_chars,
-        timeout       = timeout,
-        max_results   = max_results,
-        delay_between = delay_between,
+        serpapi_api_key = serpapi_api_key,
+        country_code    = country_code,
+        urls_per_sku    = urls_per_sku,
+        max_chars       = max_chars,
+        timeout         = timeout,
+        max_results     = max_results,
+        delay_between   = delay_between,
     )
     llm_cfg = LLMConfig(provider=provider_key, api_key=llm_api_key, model=llm_model)
 
@@ -556,6 +543,8 @@ if is_running and st.session_state["work_queue"]:
                                    max_workers=max_workers, debug=debug_mode)
 
     rate_limited = False
+    batch_errors = []   # collected (sku, error_msg) for display below the progress bar
+
     for result in batch_results:
         s = st.session_state["stats"]
         if result.status == "success":
@@ -571,6 +560,12 @@ if is_running and st.session_state["work_queue"]:
             s["not_found"] += 1
         else:
             s["error"] += 1
+            if result.error_msg:
+                batch_errors.append((result.sku, result.error_msg))
+                # Persist for the post-run summary panel
+                st.session_state.setdefault("error_log", []).append(
+                    {"sku": result.sku, "error": result.error_msg}
+                )
 
         if result.had_jsonld:
             s["jsonld_hint"] += 1
@@ -585,9 +580,19 @@ if is_running and st.session_state["work_queue"]:
                 "jsonld_hit":  result.had_jsonld,
                 "jsonld_hint": result.jsonld_hint,
                 "query_used":  result.query_used,
+                "error_msg":   result.error_msg,
             })
 
     st.session_state["completed_count"] += len(batch)
+
+    # Surface errors from this batch directly under the progress bar so the
+    # user sees what's failing in real time, not just an opaque ERROR flag.
+    if batch_errors and not rate_limited:
+        first_sku, first_err = batch_errors[0]
+        more = f" (+{len(batch_errors)-1} more in this batch)" if len(batch_errors) > 1 else ""
+        status_box.error(
+            f"💥 **{first_sku}** errored: {first_err[:300]}{'…' if len(first_err) > 300 else ''}{more}"
+        )
 
     # Show a quick preview of the latest results
     preview_df   = pd.DataFrame(st.session_state["results"][-20:])
@@ -635,6 +640,35 @@ if st.session_state["results"]:
 
     if stats["jsonld_hint"] > 0:
         st.caption(f"📐 **{jsonld_pct}%** of products had JSON-LD structured data — used as trusted metadata for higher accuracy.")
+
+    # ── Error diagnostic panel ──────────────────────────────────────────────
+    # Surfaces the actual provider-side messages so the user can see why rows
+    # came back as ERROR — typically auth failures, invalid model strings,
+    # quota issues, or content-filter blocks.
+    error_log = st.session_state.get("error_log", [])
+    if error_log:
+        # Group by message so a hundred identical "invalid api key" errors
+        # don't drown out the one row that failed for a different reason.
+        from collections import Counter
+        msg_counts = Counter(e["error"][:400] for e in error_log)
+
+        with st.expander(
+            f"💥 **{len(error_log)} extraction error(s)** — click to see what went wrong",
+            expanded=True,
+        ):
+            st.caption(
+                "These are messages returned by your LLM provider when extraction failed. "
+                "Most commonly: invalid API key, invalid model identifier, or rate/quota limits."
+            )
+            for msg, count in msg_counts.most_common():
+                # Show one representative SKU for each distinct error message
+                example_sku = next(
+                    (e["sku"] for e in error_log if e["error"][:400] == msg),
+                    "?"
+                )
+                badge = f"`×{count}`" if count > 1 else ""
+                st.markdown(f"**{example_sku}** {badge}")
+                st.code(msg, language=None)
 
     st.divider()
 
@@ -717,6 +751,8 @@ if st.session_state["results"]:
                 f"{status_icon} **{sku}** — {len(pages)} page(s) · {total_chars:,} chars · {jsonld_icon}",
                 expanded=False,
             ):
+                if entry.get("error_msg"):
+                    st.error(f"**LLM error:** {entry['error_msg']}")
                 if query:
                     st.markdown(f"**Search query used:** `{query}`")
                 if hint:

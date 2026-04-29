@@ -1,10 +1,12 @@
 """
 src/search_client.py
-DuckDuckGo search + direct httpx fetch + trafilatura content extraction.
-No external API keys required.
+SerpAPI Google search + direct httpx fetch + trafilatura content extraction.
 
-Cascade search strategy: tries multiple identifier combinations until one
-returns results with at least one identifier code in URL/title/snippet.
+Strategy: exact-match Google search on a user-mapped Primary column. If that
+returns zero results, retry on a user-mapped Fallback column. Both column
+mappings are user-configured in the sidebar — no hardcoded priorities.
+
+Per row: 1 SerpAPI query when the primary works, 2 when it doesn't.
 """
 
 import time
@@ -12,23 +14,22 @@ import httpx
 import trafilatura
 from dataclasses import dataclass
 
-from ddgs import DDGS
-
 from .content_cleaner import extract_jsonld
 
 
-# Country code → DDG region (lang-region format used by ddgs)
-DDG_REGIONS = {
-    "AU": "au-en",
-    "US": "us-en",
-    "UK": "uk-en",
-    "NZ": "nz-en",
-    "CA": "ca-en",
-    "DE": "de-de",
-    "FR": "fr-fr",
-    "JP": "jp-jp",
-    "SG": "sg-en",
-    "IN": "in-en",
+# Country code → SerpAPI gl param (lowercase ISO 3166-1 alpha-2,
+# matching Google's country code conventions — UK is "gb")
+SERPAPI_COUNTRIES = {
+    "AU": "au", "US": "us", "UK": "gb", "NZ": "nz", "CA": "ca",
+    "DE": "de", "FR": "fr", "JP": "jp", "SG": "sg", "IN": "in",
+}
+
+COUNTRY_LABELS = {
+    "AU": "🇦🇺  Australia",       "US": "🇺🇸  United States",
+    "UK": "🇬🇧  United Kingdom",  "NZ": "🇳🇿  New Zealand",
+    "CA": "🇨🇦  Canada",           "DE": "🇩🇪  Germany",
+    "FR": "🇫🇷  France",           "JP": "🇯🇵  Japan",
+    "SG": "🇸🇬  Singapore",        "IN": "🇮🇳  India",
 }
 
 LOW_VALUE_DOMAINS = {
@@ -57,165 +58,154 @@ _BROWSER_HEADERS = {
 }
 
 
-# ── Config and identifier types ───────────────────────────────────────────────
+# ── Identifiers ───────────────────────────────────────────────────────────────
 
 @dataclass
 class IdentifierSet:
-    """Per-row identifiers used for cascade search and validation.
+    """Per-row identifier values pulled from the user's mapped columns.
 
-    Empty fields are simply skipped — only populated identifiers contribute
-    search stages and validation matches.
+    primary  is searched first (exact-quoted Google).
+    fallback is searched only if the primary search returns zero results.
+    Both are also passed to the LLM as match anchors and used for content
+    validation.
     """
-    sku:               str = ""
-    manufacturer_code: str = ""
-    brand:             str = ""
-    product_name:      str = ""
+    primary:  str = ""
+    fallback: str = ""
 
-    def code_identifiers(self) -> list[str]:
-        """Codes used for relevance matching in search results and content."""
-        codes = []
-        for c in (self.sku, self.manufacturer_code):
-            c = (c or "").strip()
-            if c and c not in codes:
-                codes.append(c)
-        return codes
+    def codes(self) -> list[str]:
+        """All non-empty identifier values, deduped."""
+        out = []
+        for v in (self.primary, self.fallback):
+            v = (v or "").strip()
+            if v and v not in out:
+                out.append(v)
+        return out
 
     def is_empty(self) -> bool:
-        return not any([self.sku, self.manufacturer_code,
-                        self.brand, self.product_name])
+        return not (self.primary.strip() or self.fallback.strip())
 
     def display_label(self) -> str:
-        """Short label for progress UI — uses the first populated identifier."""
-        for v in (self.sku, self.manufacturer_code, self.product_name):
-            if v:
-                return str(v)
-        return "(unknown)"
+        """Short label for progress UI."""
+        return self.primary.strip() or self.fallback.strip() or "(unknown)"
 
 
 @dataclass
 class SearchConfig:
-    country_code:  str   = "AU"
-    urls_per_sku:  int   = 2
-    max_chars:     int   = 4000
-    timeout:       int   = 25
-    max_results:   int   = 10
-    delay_between: float = 0.5
+    serpapi_api_key: str   = ""
+    country_code:    str   = "AU"
+    urls_per_sku:    int   = 2
+    max_chars:       int   = 4000
+    timeout:         int   = 25
+    max_results:     int   = 10
+    delay_between:   float = 0.5
 
 
 class RateLimitError(Exception):
     pass
 
 
+class BackendConfigError(Exception):
+    """SerpAPI is misconfigured (missing key, exhausted quota, account block)."""
+    pass
+
+
 # ── Search ────────────────────────────────────────────────────────────────────
 
-def _ddg_search(query: str, region: str, max_results: int) -> list[dict]:
-    """One DuckDuckGo query. Returns [{url, title, snippet}, ...]."""
+def search(query: str, cfg: SearchConfig) -> list[dict]:
+    """
+    One Google search via SerpAPI. Returns [{url, title, snippet}, ...].
+
+    SerpAPI billing note: only successful searches that return data count
+    against quota. Empty results, errors, and rate-limited requests are not
+    charged — so a primary-search miss followed by a fallback search costs
+    only 1 quota credit, not 2.
+    """
     if not query.strip():
         return []
+    if not cfg.serpapi_api_key:
+        raise BackendConfigError("SerpAPI key not configured")
+
+    gl = SERPAPI_COUNTRIES.get(cfg.country_code.upper(), "au")
+    params = {
+        "api_key": cfg.serpapi_api_key,
+        "engine":  "google",
+        "q":       query,
+        "gl":      gl,
+        "hl":      "en",
+        "num":     min(cfg.max_results, 20),
+    }
+
     try:
-        with DDGS() as ddgs:
-            raw = ddgs.text(query, region=region, max_results=max_results) or []
-    except Exception as e:
-        msg = str(e).lower()
-        if any(k in msg for k in ("ratelimit", "rate limit", "too many", "202", "429")):
-            raise RateLimitError(f"DuckDuckGo rate limited: {e}")
-        # Other transport errors: treat as empty result, let the cascade try next
+        with httpx.Client(timeout=cfg.timeout) as client:
+            r = client.get("https://serpapi.com/search.json", params=params)
+            status = r.status_code
+            if status == 429:
+                raise RateLimitError("SerpAPI rate limited (429)")
+            if status in (401, 403):
+                raise BackendConfigError(
+                    f"SerpAPI key rejected ({status}). "
+                    "Check the key at serpapi.com/manage-api-key"
+                )
+            r.raise_for_status()
+            data = r.json()
+    except (RateLimitError, BackendConfigError):
+        raise
+    except Exception:
+        # Transport/JSON parse errors — return empty so the caller can decide
         return []
 
+    # SerpAPI surfaces application-level errors in its JSON body
+    err_msg = data.get("error")
+    if err_msg:
+        msg_lower = str(err_msg).lower()
+        if "invalid api key" in msg_lower or "expired" in msg_lower:
+            raise BackendConfigError(f"SerpAPI: {err_msg}")
+        if any(k in msg_lower for k in ("run out of searches", "quota", "exceed")):
+            raise RateLimitError(f"SerpAPI quota exhausted: {err_msg}")
+        raise BackendConfigError(f"SerpAPI error: {err_msg}")
+
+    organic = data.get("organic_results", []) or []
     results = []
-    for r in raw:
-        url = r.get("href") or r.get("url") or ""
+    for r in organic[:cfg.max_results]:
+        url = r.get("link", "")
         if not url:
             continue
         results.append({
             "url":     url,
             "title":   r.get("title", "") or "",
-            "snippet": r.get("body", "") or r.get("description", "") or "",
+            "snippet": r.get("snippet", "") or "",
         })
     return results
 
 
-def _result_matches_any(result: dict, identifiers: list[str]) -> bool:
-    """True if any identifier appears in the result's URL, title, or snippet."""
-    if not identifiers:
-        return False
-    haystack = " ".join([
-        result.get("url", "") or "",
-        result.get("title", "") or "",
-        result.get("snippet", "") or "",
-    ]).lower()
-    return any(i.lower() in haystack for i in identifiers if i)
-
-
-def _looks_relevant(results: list[dict], codes: list[str]) -> bool:
-    if not results:
-        return False
-    if not codes:
-        return len(results) >= 2  # no codes to match against — use volume
-    return any(_result_matches_any(r, codes) for r in results)
-
-
-def _build_cascade(ids: IdentifierSet) -> list[str]:
-    """Build the ordered list of search queries to try."""
-    stages = []
-
-    mfr  = ids.manufacturer_code.strip() if ids.manufacturer_code else ""
-    sku  = ids.sku.strip() if ids.sku else ""
-    brand = ids.brand.strip() if ids.brand else ""
-    name  = ids.product_name.strip() if ids.product_name else ""
-
-    # 1. Manufacturer code is the strongest signal — try it quoted first
-    if mfr:
-        stages.append(f'"{mfr}"')
-
-    # 2. SKU quoted (skip if it's identical to mfr code)
-    if sku and sku.lower() != mfr.lower():
-        stages.append(f'"{sku}"')
-
-    # 3. Mfr code + brand (helps when the bare code is ambiguous)
-    if mfr and brand:
-        stages.append(f'"{mfr}" {brand}')
-
-    # 4. SKU + brand
-    if sku and brand and sku.lower() != mfr.lower():
-        stages.append(f'"{sku}" {brand}')
-
-    # 5. Product name as the last-resort wide net
-    if name:
-        # Combine with brand if available — often sharpens niche product searches
-        stages.append(f'{name} {brand}'.strip() if brand else name)
-
-    return stages
-
-
 def search_for_product(ids: IdentifierSet, cfg: SearchConfig) -> tuple[list[dict], str]:
     """
-    Run the cascade. Returns (results, query_used).
-    Stops at the first stage whose results contain at least one of the
-    identifier codes in URL/title/snippet. Falls back to the largest
-    non-empty result set if no stage matches strongly.
+    Two-stage exact-match search:
+      1. `"primary_value"` — quoted Google search via SerpAPI
+      2. `"fallback_value"` — only runs if stage 1 returned zero results
+
+    Returns (results, query_used). Empty results means neither column found
+    anything on Google — the row is genuinely not findable, no further
+    fallbacks are tried.
     """
-    region = DDG_REGIONS.get(cfg.country_code.upper(), "au-en")
-    codes  = ids.code_identifiers()
+    primary_val  = (ids.primary or "").strip()
+    fallback_val = (ids.fallback or "").strip()
 
-    cascade = _build_cascade(ids)
-    if not cascade:
-        return [], ""
-
-    best_results = []
-    best_query   = ""
-
-    for query in cascade:
-        results = _ddg_search(query, region, cfg.max_results)
-
-        if _looks_relevant(results, codes):
+    # Stage 1: primary
+    if primary_val:
+        query = f'"{primary_val}"'
+        results = search(query, cfg)
+        if results:
             return results, query
 
-        if len(results) > len(best_results):
-            best_results = results
-            best_query   = query
+    # Stage 2: fallback (only if primary was empty or returned nothing)
+    if fallback_val and fallback_val.lower() != primary_val.lower():
+        query = f'"{fallback_val}"'
+        results = search(query, cfg)
+        if results:
+            return results, query
 
-    return best_results, best_query
+    return [], ""
 
 
 def score_url(result: dict) -> int:
@@ -249,11 +239,8 @@ def select_top_urls(results: list[dict], n: int) -> list[dict]:
 
 def fetch_page(url: str, cfg: SearchConfig) -> dict | None:
     """
-    Direct httpx GET → trafilatura content extraction. JSON-LD is pulled from
-    the raw HTML before extraction so the structured-data hint survives.
-
-    Returns {content, jsonld, raw_status} or None if the page couldn't be
-    usefully fetched (4xx/5xx, blocked, JS-only, or extracted < 200 chars).
+    Direct httpx GET → trafilatura content extraction. JSON-LD is pulled
+    from raw HTML before extraction so the structured-data hint survives.
     """
     try:
         with httpx.Client(headers=_BROWSER_HEADERS, follow_redirects=True,
@@ -269,12 +256,8 @@ def fetch_page(url: str, cfg: SearchConfig) -> dict | None:
     if not html or len(html) < 100:
         return None
 
-    # 1. JSON-LD from raw HTML — must run before trafilatura strips scripts
     jsonld = extract_jsonld(html)
 
-    # 2. Main content via trafilatura. favor_precision drops more boilerplate
-    #    at the cost of occasional content loss on ambiguous pages — safer for
-    #    LLM extraction where a clean signal beats a noisy maximum.
     extracted = trafilatura.extract(
         html,
         include_links=False,
@@ -287,7 +270,6 @@ def fetch_page(url: str, cfg: SearchConfig) -> dict | None:
     if not extracted or len(extracted) < 200:
         return None
 
-    # 3. Truncate at max_chars on a paragraph boundary
     if len(extracted) > cfg.max_chars:
         truncated = extracted[:cfg.max_chars]
         cut       = truncated.rfind("\n\n")
@@ -303,10 +285,8 @@ def fetch_pages_for_product(
     cfg: SearchConfig,
 ) -> tuple[list[dict], str, str]:
     """
-    Full per-product pipeline: cascade search → score → fetch.
+    Per-product pipeline: search → score top URLs → fetch.
     Returns (pages, status, query_used).
-
-    Each page is {url, content, jsonld_hint}.
     """
     if ids.is_empty():
         return [], "not_found", ""
@@ -315,6 +295,10 @@ def fetch_pages_for_product(
         results, query = search_for_product(ids, cfg)
     except RateLimitError:
         return [], "rate_limited", ""
+    except BackendConfigError:
+        # Misconfigured SerpAPI propagates so the pipeline shows a real error
+        # instead of silently logging not_found for every row in the batch.
+        raise
     except Exception:
         return [], "not_found", ""
 
@@ -344,14 +328,8 @@ def fetch_pages_for_product(
 
 
 def content_validates_product(content: str, ids: IdentifierSet) -> bool:
-    """
-    Sanity check: do any identifier codes appear in the fetched page content?
-    Returns True if no codes are configured (nothing to validate against) OR
-    at least one code appears in the content.
-
-    Used to flag pages that may be about a different product entirely.
-    """
-    codes = ids.code_identifiers()
+    """Sanity check: does primary or fallback value appear in the fetched page?"""
+    codes = ids.codes()
     if not codes:
         return True
     if not content:

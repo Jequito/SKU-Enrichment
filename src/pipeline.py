@@ -56,7 +56,7 @@ def process_product(
 
     # 1. Search + fetch
     try:
-        pages, fetch_status, query_used = fetch_pages_for_product(ids, search_cfg)
+        pages, fetch_status, query_used, fetch_errors = fetch_pages_for_product(ids, search_cfg)
     except RateLimitError as e:
         return SKUResult(sku=sku_label, status="rate_limited",
                          data=_empty_row(original_row, output_fields, "RATE_LIMITED"),
@@ -67,9 +67,21 @@ def process_product(
                          sources=[], error_msg=str(e))
 
     if fetch_status in ("not_found", "blocked", "rate_limited"):
+        # Build a readable summary of why fetches failed so the user sees
+        # actual reasons (HTTP 403, timeout, etc.) instead of an opaque
+        # BLOCKED flag. Limited to first 3 attempts to keep the panel tidy.
+        block_msg = ""
+        if fetch_errors:
+            parts = []
+            for fe in fetch_errors[:3]:
+                if fe.get("url"):
+                    parts.append(f"{fe['url']} → {fe['error']}")
+                else:
+                    parts.append(fe["error"])
+            block_msg = " | ".join(parts)
         return SKUResult(sku=sku_label, status=fetch_status,
                          data=_empty_row(original_row, output_fields, fetch_status.upper()),
-                         sources=[], query_used=query_used)
+                         sources=[], error_msg=block_msg, query_used=query_used)
 
     sources = [p["url"] for p in pages]
 

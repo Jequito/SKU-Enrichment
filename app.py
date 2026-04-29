@@ -169,12 +169,7 @@ with st.sidebar:
 
     serpapi_api_key = st.text_input(
         "SerpAPI Key", type="password", disabled=is_running,
-        help="Get a key at serpapi.com/manage-api-key. Free tier is 100 searches/month.",
-    )
-    st.caption(
-        "💰 SerpAPI free tier: **100 searches/month** (~50 SKUs). "
-        "Paid plans start at **$75/month** for 5,000 searches (~2,500 SKUs). "
-        "Each row uses 1 query when the primary column finds a match, 2 when it falls back."
+        help="Get a key at serpapi.com/manage-api-key.",
     )
 
     country_code = st.selectbox(
@@ -184,8 +179,23 @@ with st.sidebar:
         help="Passed to Google as the gl parameter — biases results to that locale.",
     )
 
-    urls_per_sku = st.slider("URLs per product", 1, 5, 2, disabled=is_running,
-                              help="Number of top-scored URLs to fetch and pass to the LLM. With exact-match Google searches the top hit is usually correct — 1 is often enough.")
+    urls_per_sku = st.slider("URLs per product", 1, 5, 1, disabled=is_running,
+                              help="Number of top-scored URLs to fetch and pass to the LLM. With exact-match Google searches the top hit is usually correct — 1 is enough most of the time.")
+
+    blocked_domains_text = st.text_area(
+        "Blocked domains (one per line)",
+        value="",
+        height=80,
+        disabled=is_running,
+        placeholder="yourcompany.com\nyourothersite.com.au",
+        help=(
+            "Domains to exclude from search results — useful for skipping your own "
+            "sites so you don't enrich a SKU using data from the very page you're "
+            "trying to populate. Substring match: 'yourcompany.com' also blocks "
+            "shop.yourcompany.com. Social, marketplace and aggregator sites are "
+            "already excluded by default."
+        ),
+    )
 
     with st.expander("Advanced fetch settings"):
         max_chars = st.slider("Max chars per page", 2000, 12000, 4000, step=500,
@@ -501,8 +511,25 @@ if start_btn and is_paused:
 # to take effect within one batch's worth of latency.
 
 if is_running and st.session_state["work_queue"]:
+    # Parse the user blocklist textarea — normalise to bare domain substrings.
+    # Substring match is intentional: "yourcompany.com" also matches
+    # shop.yourcompany.com without requiring the user to enumerate subdomains.
+    def _normalise_domain(s: str) -> str:
+        s = s.strip().lower()
+        for prefix in ("https://", "http://", "www."):
+            if s.startswith(prefix):
+                s = s[len(prefix):]
+        return s.rstrip("/")
+
+    user_blocked = tuple(
+        _normalise_domain(d)
+        for d in (blocked_domains_text or "").splitlines()
+        if d.strip()
+    )
+
     search_cfg = SearchConfig(
         serpapi_api_key = serpapi_api_key,
+        blocked_domains = user_blocked,
         country_code    = country_code,
         urls_per_sku    = urls_per_sku,
         max_chars       = max_chars,
@@ -558,13 +585,20 @@ if is_running and st.session_state["work_queue"]:
             status_box.error(f"🚫 Rate limit hit on **{result.sku}**. Pausing — results so far are safe to download.")
         elif result.status in ("not_found", "blocked"):
             s["not_found"] += 1
+            # Surface the actual reason (HTTP 403, timeout, recall-and-precision
+            # both empty, blocklisted, etc.) so the user can act on it.
+            if result.error_msg:
+                kind = "blocked" if result.status == "blocked" else "not_found"
+                st.session_state.setdefault("error_log", []).append(
+                    {"sku": result.sku, "error": result.error_msg, "kind": kind}
+                )
         else:
             s["error"] += 1
             if result.error_msg:
                 batch_errors.append((result.sku, result.error_msg))
                 # Persist for the post-run summary panel
                 st.session_state.setdefault("error_log", []).append(
-                    {"sku": result.sku, "error": result.error_msg}
+                    {"sku": result.sku, "error": result.error_msg, "kind": "llm_error"}
                 )
 
         if result.had_jsonld:
@@ -641,34 +675,60 @@ if st.session_state["results"]:
     if stats["jsonld_hint"] > 0:
         st.caption(f"📐 **{jsonld_pct}%** of products had JSON-LD structured data — used as trusted metadata for higher accuracy.")
 
-    # ── Error diagnostic panel ──────────────────────────────────────────────
-    # Surfaces the actual provider-side messages so the user can see why rows
-    # came back as ERROR — typically auth failures, invalid model strings,
-    # quota issues, or content-filter blocks.
+    # ── Diagnostic panel ───────────────────────────────────────────────────
+    # Surfaces what actually went wrong on each problem row, grouped by kind
+    # and message so a single global issue doesn't drown out per-row ones.
     error_log = st.session_state.get("error_log", [])
     if error_log:
-        # Group by message so a hundred identical "invalid api key" errors
-        # don't drown out the one row that failed for a different reason.
         from collections import Counter
-        msg_counts = Counter(e["error"][:400] for e in error_log)
 
-        with st.expander(
-            f"💥 **{len(error_log)} extraction error(s)** — click to see what went wrong",
-            expanded=True,
-        ):
-            st.caption(
-                "These are messages returned by your LLM provider when extraction failed. "
-                "Most commonly: invalid API key, invalid model identifier, or rate/quota limits."
-            )
-            for msg, count in msg_counts.most_common():
-                # Show one representative SKU for each distinct error message
-                example_sku = next(
-                    (e["sku"] for e in error_log if e["error"][:400] == msg),
-                    "?"
+        llm_errors    = [e for e in error_log if e.get("kind") == "llm_error"]
+        fetch_blocks  = [e for e in error_log if e.get("kind") == "blocked"]
+
+        n_llm   = len(llm_errors)
+        n_block = len(fetch_blocks)
+
+        header_parts = []
+        if n_llm:   header_parts.append(f"{n_llm} extraction error(s)")
+        if n_block: header_parts.append(f"{n_block} fetch block(s)")
+        header = " · ".join(header_parts) or f"{len(error_log)} issue(s)"
+
+        with st.expander(f"💥 **Diagnostics — {header}**", expanded=True):
+
+            if llm_errors:
+                st.markdown("**LLM extraction errors**")
+                st.caption(
+                    "Returned by your LLM provider. Common causes: invalid API key, "
+                    "wrong model identifier, quota/rate limits, content filters."
                 )
-                badge = f"`×{count}`" if count > 1 else ""
-                st.markdown(f"**{example_sku}** {badge}")
-                st.code(msg, language=None)
+                msg_counts = Counter(e["error"][:400] for e in llm_errors)
+                for msg, count in msg_counts.most_common():
+                    example_sku = next(
+                        (e["sku"] for e in llm_errors if e["error"][:400] == msg),
+                        "?",
+                    )
+                    badge = f"`×{count}`" if count > 1 else ""
+                    st.markdown(f"**{example_sku}** {badge}")
+                    st.code(msg, language=None)
+
+            if fetch_blocks:
+                if llm_errors:
+                    st.divider()
+                st.markdown("**Fetch blocks** (search found URLs but couldn't usefully read them)")
+                st.caption(
+                    "Common causes: HTTP 403/Cloudflare, JS-only SPA pages, login walls, "
+                    "broken links, or domain blocked by your blocklist. The actual reason "
+                    "for each URL attempted is shown below."
+                )
+                msg_counts = Counter(e["error"][:400] for e in fetch_blocks)
+                for msg, count in msg_counts.most_common():
+                    example_sku = next(
+                        (e["sku"] for e in fetch_blocks if e["error"][:400] == msg),
+                        "?",
+                    )
+                    badge = f"`×{count}`" if count > 1 else ""
+                    st.markdown(f"**{example_sku}** {badge}")
+                    st.code(msg, language=None)
 
     st.divider()
 

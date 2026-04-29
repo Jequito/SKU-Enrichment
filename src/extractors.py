@@ -176,7 +176,6 @@ def extract_openai(ids, pages, fields, api_key, model, jsonld_hint=None, max_cha
 GEMINI_MODELS = [
     "gemini-2.5-flash",   # current cheap+fast — recommended default
     "gemini-2.5-pro",     # higher quality, more expensive
-    "gemini-2.0-flash",   # legacy fallback
 ]
 
 def extract_gemini(ids, pages, fields, api_key, model, jsonld_hint=None, max_chars=0):

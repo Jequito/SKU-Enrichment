@@ -92,6 +92,7 @@ class IdentifierSet:
 @dataclass
 class SearchConfig:
     serpapi_api_key: str   = ""
+    blocked_domains: tuple = ()      # extra user-blocked domains (substring match)
     country_code:    str   = "AU"
     urls_per_sku:    int   = 2
     max_chars:       int   = 4000
@@ -208,13 +209,14 @@ def search_for_product(ids: IdentifierSet, cfg: SearchConfig) -> tuple[list[dict
     return [], ""
 
 
-def score_url(result: dict) -> int:
+def score_url(result: dict, extra_blocked: set | None = None) -> int:
     url    = (result.get("url") or "").lower()
     title  = (result.get("title") or "").lower()
     domain = url.split("/")[2] if url.count("/") >= 2 else url
     if url.endswith(".pdf"):
         return -1
-    if any(bad in domain for bad in LOW_VALUE_DOMAINS):
+    blocked = LOW_VALUE_DOMAINS | (extra_blocked or set())
+    if any(bad in domain for bad in blocked):
         return -1
     score = 0
     for sig in HIGH_VALUE_SIGNALS:
@@ -227,20 +229,24 @@ def score_url(result: dict) -> int:
     return score
 
 
-def select_top_urls(results: list[dict], n: int) -> list[dict]:
-    scored = [(score_url(r), r) for r in results]
+def select_top_urls(results: list[dict], n: int, extra_blocked: set | None = None) -> list[dict]:
+    scored = [(score_url(r, extra_blocked), r) for r in results]
     scored = [(s, r) for s, r in scored if s >= 0]
     scored.sort(key=lambda x: x[0], reverse=True)
     top = [r for _, r in scored[:n]]
-    return top if top else results[:n]
+    return top if top else []
 
 
 # ── Fetch ─────────────────────────────────────────────────────────────────────
 
-def fetch_page(url: str, cfg: SearchConfig) -> dict | None:
+def fetch_page(url: str, cfg: SearchConfig) -> dict:
     """
     Direct httpx GET → trafilatura content extraction. JSON-LD is pulled
     from raw HTML before extraction so the structured-data hint survives.
+
+    Always returns a dict. On success: {ok: True, content, jsonld, status}.
+    On failure: {ok: False, error: "..."} with a brief reason — used by the
+    pipeline to surface BLOCKED diagnostics in the UI.
     """
     try:
         with httpx.Client(headers=_BROWSER_HEADERS, follow_redirects=True,
@@ -248,16 +254,26 @@ def fetch_page(url: str, cfg: SearchConfig) -> dict | None:
             r = client.get(url)
             status = r.status_code
             if status >= 400:
-                return None
+                return {"ok": False, "error": f"HTTP {status}"}
             html = r.text
-    except Exception:
-        return None
+    except httpx.TimeoutException:
+        return {"ok": False, "error": "Timeout"}
+    except httpx.RequestError as e:
+        return {"ok": False, "error": f"Connection: {type(e).__name__}"}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:80]}"}
 
     if not html or len(html) < 100:
-        return None
+        return {"ok": False, "error": f"Empty response ({len(html or '')} chars)"}
 
     jsonld = extract_jsonld(html)
 
+    # Two-pass extraction. Precision mode is the right default for product
+    # pages — it drops more boilerplate (nav, related products, FAQs) and
+    # gives the LLM a cleaner signal. But on awkwardly-structured pages it
+    # sometimes drops too much and we'd otherwise mark the row BLOCKED.
+    # When that happens, retry with recall mode which keeps more text and
+    # rescues the page. No extra network cost — same HTML, second parse.
     extracted = trafilatura.extract(
         html,
         include_links=False,
@@ -267,8 +283,26 @@ def fetch_page(url: str, cfg: SearchConfig) -> dict | None:
         favor_precision=True,
     )
 
+    used_recall = False
     if not extracted or len(extracted) < 200:
-        return None
+        recall_extracted = trafilatura.extract(
+            html,
+            include_links=False,
+            include_tables=True,
+            include_comments=False,
+            output_format="markdown",
+            favor_recall=True,
+        )
+        if recall_extracted and len(recall_extracted) >= 200:
+            extracted = recall_extracted
+            used_recall = True
+
+    if not extracted or len(extracted) < 200:
+        return {
+            "ok": False,
+            "error": f"Extracted only {len(extracted or '')} chars after cleaning "
+                     "(JS-only page, login wall, or anti-bot — both precision and recall passes failed)",
+        }
 
     if len(extracted) > cfg.max_chars:
         truncated = extracted[:cfg.max_chars]
@@ -277,54 +311,83 @@ def fetch_page(url: str, cfg: SearchConfig) -> dict | None:
             truncated = truncated[:cut]
         extracted = truncated
 
-    return {"content": extracted, "jsonld": jsonld, "status": status}
+    return {
+        "ok":          True,
+        "content":     extracted,
+        "jsonld":      jsonld,
+        "status":      status,
+        "used_recall": used_recall,
+    }
 
 
 def fetch_pages_for_product(
     ids: IdentifierSet,
     cfg: SearchConfig,
-) -> tuple[list[dict], str, str]:
+) -> tuple[list[dict], str, str, list[dict]]:
     """
     Per-product pipeline: search → score top URLs → fetch.
-    Returns (pages, status, query_used).
+    Returns (pages, status, query_used, fetch_errors).
+
+    fetch_errors is a list of {url, error} entries for URLs that were tried
+    and failed, plus a synthetic entry if all results were filtered out by
+    the domain blocklist before any fetch was attempted. Used by the pipeline
+    to surface BLOCKED diagnostics in the UI.
     """
     if ids.is_empty():
-        return [], "not_found", ""
+        return [], "not_found", "", []
 
     try:
         results, query = search_for_product(ids, cfg)
     except RateLimitError:
-        return [], "rate_limited", ""
+        return [], "rate_limited", "", []
     except BackendConfigError:
         # Misconfigured SerpAPI propagates so the pipeline shows a real error
         # instead of silently logging not_found for every row in the batch.
         raise
     except Exception:
-        return [], "not_found", ""
+        return [], "not_found", "", []
 
     if not results:
-        return [], "not_found", query
+        return [], "not_found", query, []
 
-    top_urls = select_top_urls(results, cfg.urls_per_sku)
-    pages    = []
+    extra_blocked = set(cfg.blocked_domains or ())
+    top_urls = select_top_urls(results, cfg.urls_per_sku, extra_blocked)
 
+    fetch_errors: list[dict] = []
+
+    if not top_urls:
+        # Every search result was filtered out — most often by the user's
+        # blocklist. Surface that explicitly so they understand why.
+        sample = ", ".join((r.get("url") or "").split("/")[2] for r in results[:3])
+        fetch_errors.append({
+            "url": "",
+            "error": f"All {len(results)} search results filtered by domain blocklist (saw: {sample})",
+        })
+        return [], "blocked", query, fetch_errors
+
+    pages: list[dict] = []
     for result in top_urls:
         try:
             fetched = fetch_page(result["url"], cfg)
-        except Exception:
-            fetched = None
+        except Exception as e:
+            fetched = {"ok": False, "error": f"Unexpected: {type(e).__name__}"}
 
-        if fetched and len(fetched["content"]) > 200:
+        if fetched.get("ok"):
             pages.append({
                 "url":         result["url"],
                 "content":     fetched["content"],
                 "jsonld_hint": fetched.get("jsonld"),
             })
+        else:
+            fetch_errors.append({
+                "url":   result["url"],
+                "error": fetched.get("error", "Unknown"),
+            })
         time.sleep(cfg.delay_between)
 
     if not pages:
-        return [], "blocked", query
-    return pages, "ok", query
+        return [], "blocked", query, fetch_errors
+    return pages, "ok", query, fetch_errors
 
 
 def content_validates_product(content: str, ids: IdentifierSet) -> bool:

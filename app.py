@@ -130,6 +130,7 @@ defaults = {
     "sku_column":       "",
     "selected_fields":  [],
     "run_export_fields": [],  # locked at job start — immune to post-run UI changes
+    "debug_log":         [],  # list of {sku, pages:[{url, cleaned_chars, cleaned_text}], jsonld_hint}
     "input_rows":     [],
     "input_columns":  [],
     "fieldnames":     [],
@@ -204,6 +205,47 @@ with st.sidebar:
         delay_between = st.slider("Delay between fetches (s)", 0.0, 3.0, 0.5, step=0.25,
                                    disabled=is_running)
 
+        st.markdown("**DOM-level content targeting**")
+        st.caption(
+            "Applied by Jina _before_ converting to markdown — more reliable than "
+            "post-hoc heuristics because they target real HTML elements. "
+            "Leave blank to use automatic extraction."
+        )
+        target_selector = st.text_input(
+            "Include only (CSS selector)",
+            value="",
+            placeholder="article, .product-description, #main-content",
+            disabled=is_running,
+            help=(
+                "Jina returns ONLY the elements matching this selector. "
+                "Best for sites where product content is in a consistent container. "
+                "Example: 'article' for most blogs, '.product__description' for Shopify, "
+                "'#product-details' for custom sites. Use the debug panel to check results."
+            ),
+        )
+        remove_selector = st.text_input(
+            "Remove (CSS selector)",
+            value="nav, footer, header, .sidebar, #ads, .cookie-banner, .related-products",
+            placeholder="nav, footer, .sidebar, #ads",
+            disabled=is_running,
+            help=(
+                "Jina strips these elements from the DOM before extraction. "
+                "Safe to leave at the default — it removes the most common junk. "
+                "Can be used alongside 'Include only' (remove runs first)."
+            ),
+        )
+        use_readerlm = st.toggle(
+            "Use ReaderLM-v2",
+            value=False,
+            disabled=is_running,
+            help=(
+                "Uses Jina's dedicated small language model for HTML→markdown conversion. "
+                "Significantly better on complex or heavily structured pages (tables, nested specs). "
+                "Costs approximately 3× more Jina tokens per page — not recommended for large batches "
+                "unless you're seeing poor content quality."
+            ),
+        )
+
     # ── Performance ───────────────────────────────────────────────────────────
     st.markdown('<div class="sidebar-section">Performance & Rate Limiting</div>', unsafe_allow_html=True)
 
@@ -220,6 +262,19 @@ with st.sidebar:
     delay_between_skus = st.slider(
         "Delay between batches (seconds)", 0, 10, 1, disabled=is_running,
         help="Pause between each concurrent batch — helps avoid rate limits at scale",
+    )
+
+    st.divider()
+    debug_mode = st.toggle(
+        "🔬 Debug mode",
+        value=False,
+        disabled=is_running,
+        help=(
+            "Stores the exact cleaned text sent to the LLM for each SKU. "
+            "After a run, a debug panel appears in the results area showing "
+            "character counts, JSON-LD hits, and the full text per page. "
+            "Turn off for large batches — it stores all cleaned content in memory."
+        ),
     )
 
     # Runtime estimate
@@ -372,6 +427,21 @@ with st.expander("ℹ️ How this tool works", expanded=False):
     <p>Pause between each concurrent worker batch. Gives both Jina and your LLM provider time to recover between bursts, especially useful for large jobs running overnight.</p>
     <span class="tag pro">reduces rate limit risk</span><span class="tag con">increases total runtime</span>
   </div>
+  <div class="help-card">
+    <h4>Include only (CSS selector)</h4>
+    <p>Tells Jina to return <em>only</em> the DOM elements matching this CSS selector, before converting to markdown. Far more reliable than heuristic cleaning because it targets real HTML structure. Example: <code>article</code>, <code>.product-description</code>, <code>#main-content</code>. Leave blank to let Jina auto-extract.</p>
+    <span class="tag pro">surgical nav removal</span><span class="tag con">needs site-specific selectors</span>
+  </div>
+  <div class="help-card">
+    <h4>Remove (CSS selector)</h4>
+    <p>Strips matching DOM elements before extraction — runs before the Include selector. The default covers the most common junk: <code>nav, footer, header, .sidebar, #ads</code>. Safe to leave at the default for most sites.</p>
+    <span class="tag pro">removes nav at source</span><span class="tag con">wrong selectors may remove content</span>
+  </div>
+  <div class="help-card">
+    <h4>Use ReaderLM-v2</h4>
+    <p>Switches Jina to use its dedicated small language model for HTML-to-markdown conversion instead of the default rule-based approach. Produces significantly cleaner output on complex or heavily structured pages with spec tables and nested content.</p>
+    <span class="tag pro">better on complex pages</span><span class="tag con">approx 3× Jina token cost</span>
+  </div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -520,7 +590,7 @@ if stop_btn:
     st.rerun()
 
 if clear_btn:
-    for k in ["results", "fieldnames", "resume_items", "remaining_items", "run_export_fields"]:
+    for k in ["results", "fieldnames", "resume_items", "remaining_items", "run_export_fields", "debug_log"]:
         st.session_state[k] = []
     st.session_state["stats"]          = {"success": 0, "review": 0, "not_found": 0, "error": 0, "rate_limited": 0, "jsonld_hint": 0}
     st.session_state["rate_limit_hit"] = False
@@ -575,7 +645,7 @@ def _run_pipeline(work_items, total, fieldnames, jina_cfg, llm_cfg, max_workers,
             text=f"Processing **{skus_label}** ({global_done + 1}–{global_done + len(batch)}/{total})"
         )
 
-        batch_results = process_batch(batch, selected_fields, jina_cfg, llm_cfg, max_workers=max_workers)
+        batch_results = process_batch(batch, selected_fields, jina_cfg, llm_cfg, max_workers=max_workers, debug=debug_mode)
 
         rate_limited = False
         for result in batch_results:
@@ -598,6 +668,15 @@ def _run_pipeline(work_items, total, fieldnames, jina_cfg, llm_cfg, max_workers,
                 s["jsonld_hint"] += 1
 
             st.session_state["results"].append(result.data)
+
+            if debug_mode and result.debug_pages:
+                st.session_state["debug_log"].append({
+                    "sku":        result.sku,
+                    "status":     result.status,
+                    "pages":      result.debug_pages,
+                    "jsonld_hit": result.had_jsonld,
+                    "jsonld_hint": result.jsonld_hint,
+                })
 
         # ── Update the queue AFTER every batch ──────────────────────────────
         # This is the key safety write. If Streamlit kills the thread on the
@@ -640,6 +719,7 @@ if start_btn and not is_paused:
         "resume_items":     [],
         "remaining_items":  [],
         "results":          [],
+        "debug_log":        [],
         "rate_limit_hit":   False,
         "stats":            {"success": 0, "review": 0, "not_found": 0, "error": 0, "rate_limited": 0, "jsonld_hint": 0},
     })
@@ -650,6 +730,9 @@ if start_btn and not is_paused:
         timeout=timeout, no_cache=no_cache,
         return_format=return_format, retry_on_few=retry_on_few,
         delay_between=delay_between,
+        target_selector=target_selector,
+        remove_selector=remove_selector,
+        use_readerlm=use_readerlm,
     )
     llm_cfg = LLMConfig(provider=provider_key, api_key=llm_api_key, model=llm_model)
 
@@ -689,6 +772,9 @@ if start_btn and is_paused:
         timeout=timeout, no_cache=no_cache,
         return_format=return_format, retry_on_few=retry_on_few,
         delay_between=delay_between,
+        target_selector=target_selector,
+        remove_selector=remove_selector,
+        use_readerlm=use_readerlm,
     )
     llm_cfg = LLMConfig(provider=provider_key, api_key=llm_api_key, model=llm_model)
 
@@ -783,6 +869,64 @@ if st.session_state["results"]:
             file_name=f"{export_label}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
+    # ── Debug panel ──────────────────────────────────────────────────────────
+    debug_log = st.session_state.get("debug_log", [])
+    if debug_log:
+        st.divider()
+        st.markdown("### 🔬 Debug Log")
+        st.caption(
+            f"{len(debug_log)} SKUs captured · "
+            f"Toggle **Debug mode** in the sidebar off to disable logging on future runs"
+        )
+
+        for entry in debug_log:
+            sku        = entry["sku"]
+            status     = entry["status"]
+            jsonld_hit = entry["jsonld_hit"]
+            pages      = entry["pages"]
+            hint       = entry.get("jsonld_hint", {})
+
+            status_icon = {"success": "✅", "review": "⚠️", "error": "❌",
+                           "not_found": "🔍", "rate_limited": "🚫"}.get(status, "•")
+            jsonld_icon = "🏷️ JSON-LD hit" if jsonld_hit else "⬜ No JSON-LD"
+            total_chars = sum(p["cleaned_chars"] for p in pages)
+
+            with st.expander(
+                f"{status_icon} **{sku}** — {len(pages)} page(s) · {total_chars:,} chars analysed · {jsonld_icon}",
+                expanded=False,
+            ):
+                if hint:
+                    st.markdown("**JSON-LD hint injected into prompt:**")
+                    st.json(hint, expanded=False)
+
+                for i, page in enumerate(pages, 1):
+                    url    = page["url"]
+                    chars  = page["cleaned_chars"]
+                    text   = page["cleaned_text"]
+                    max_c  = max_chars  # from sidebar
+
+                    pct_used = min(100, round(chars / max_c * 100)) if max_c else 100
+                    bar_fill = "▓" * (pct_used // 5) + "░" * (20 - pct_used // 5)
+
+                    st.markdown(
+                        f"**Source {i}:** [{url}]({url})  \n"
+                        f"`{chars:,} / {max_c:,} chars used  [{bar_fill}] {pct_used}%`"
+                    )
+                    if chars == max_c:
+                        st.warning(
+                            "⚠️ Content was truncated at the character limit — "
+                            "specs or key details may have been cut. Consider increasing Max chars per page.",
+                            icon=None,
+                        )
+                    st.text_area(
+                        f"Cleaned text — Source {i}",
+                        value=text,
+                        height=280,
+                        key=f"debug_{sku}_{i}",
+                        disabled=True,
+                        label_visibility="collapsed",
+                    )
 
 elif not is_running:
     st.markdown("""

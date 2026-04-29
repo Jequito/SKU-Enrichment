@@ -43,23 +43,31 @@ def build_prompt(
     pages:        list,
     fields:       list,
     jsonld_hint:  dict | None = None,
+    max_chars:    int = 0,
 ) -> str:
     """
     Build the extraction prompt.
     If jsonld_hint is provided it is injected as a TRUSTED METADATA block
     before the page sources. The LLM uses it as a reliable starting point
     and fills any missing or empty fields from the page content.
+
+    max_chars: if > 0, each page's content is additionally capped here.
+    Content is already cleaned and truncated by clean_content() in jina_client —
+    this cap is a safety net only. Pass 0 to trust the pre-cleaned length.
     """
     field_list = "\n".join(
         f'  "{f}": {FIELD_DEFINITIONS.get(f, f)}'
         for f in fields if f in FIELD_DEFINITIONS
     )
 
-    # Build source content
+    # Build source content — respect the configurable max_chars setting
     sources = ""
     for i, page in enumerate(pages, 1):
+        text = page["content"]
+        if max_chars and max_chars > 0:
+            text = text[:max_chars]
         sources += f"\n\n--- SOURCE {i}: {page['url']} ---\n"
-        sources += page["content"][:4000]
+        sources += text
 
     all_fields = list(fields)
     for auto in ["review_flag", "confidence_score", "source_url"]:
@@ -134,10 +142,10 @@ OPENAI_MODELS = [
     "gpt-3.5-turbo",
 ]
 
-def extract_openai(sku, pages, fields, api_key, model, jsonld_hint=None):
+def extract_openai(sku, pages, fields, api_key, model, jsonld_hint=None, max_chars=0):
     from openai import OpenAI
     client   = OpenAI(api_key=api_key)
-    prompt   = build_prompt(sku, pages, fields, jsonld_hint)
+    prompt   = build_prompt(sku, pages, fields, jsonld_hint, max_chars=max_chars)
     response = client.chat.completions.create(
         model=model,
         messages=[
@@ -159,7 +167,7 @@ GEMINI_MODELS = [
     "gemini-1.5-pro",
 ]
 
-def extract_gemini(sku, pages, fields, api_key, model, jsonld_hint=None):
+def extract_gemini(sku, pages, fields, api_key, model, jsonld_hint=None, max_chars=0):
     import google.generativeai as genai
 
     # configure() mutates global SDK state — must be serialised across threads
@@ -167,7 +175,7 @@ def extract_gemini(sku, pages, fields, api_key, model, jsonld_hint=None):
         genai.configure(api_key=api_key)
 
     m        = genai.GenerativeModel(model)
-    prompt   = f"{SYSTEM_PROMPT}\n\n{build_prompt(sku, pages, fields, jsonld_hint)}"
+    prompt   = f"{SYSTEM_PROMPT}\n\n{build_prompt(sku, pages, fields, jsonld_hint, max_chars=max_chars)}"
     response = m.generate_content(
         prompt,
         generation_config=genai.GenerationConfig(temperature=0, max_output_tokens=2048),
@@ -192,10 +200,10 @@ CLAUDE_MODELS = [
     "claude-opus-4-5",
 ]
 
-def extract_claude(sku, pages, fields, api_key, model, jsonld_hint=None):
+def extract_claude(sku, pages, fields, api_key, model, jsonld_hint=None, max_chars=0):
     import anthropic
     client   = anthropic.Anthropic(api_key=api_key)
-    prompt   = build_prompt(sku, pages, fields, jsonld_hint)
+    prompt   = build_prompt(sku, pages, fields, jsonld_hint, max_chars=max_chars)
     response = client.messages.create(
         model=model,
         max_tokens=2048,
@@ -220,12 +228,14 @@ def extract(
     fields:      list,
     cfg:         LLMConfig,
     jsonld_hint: dict | None = None,
+    max_chars:   int = 0,
 ) -> dict:
     """
     Unified extraction interface.
     jsonld_hint: optional pre-extracted JSON-LD data injected into the prompt
     as trusted metadata — the LLM uses it as a foundation and fills gaps
     from the page content. Always goes through the LLM regardless.
+    max_chars: passed to build_prompt to cap each page's content slice.
     """
     if not pages:
         return {f: "" for f in fields}
@@ -237,11 +247,11 @@ def extract(
 
     try:
         if cfg.provider == "openai":
-            result = extract_openai(sku, pages, all_fields, cfg.api_key, cfg.model, jsonld_hint)
+            result = extract_openai(sku, pages, all_fields, cfg.api_key, cfg.model, jsonld_hint, max_chars)
         elif cfg.provider == "gemini":
-            result = extract_gemini(sku, pages, all_fields, cfg.api_key, cfg.model, jsonld_hint)
+            result = extract_gemini(sku, pages, all_fields, cfg.api_key, cfg.model, jsonld_hint, max_chars)
         elif cfg.provider == "claude":
-            result = extract_claude(sku, pages, all_fields, cfg.api_key, cfg.model, jsonld_hint)
+            result = extract_claude(sku, pages, all_fields, cfg.api_key, cfg.model, jsonld_hint, max_chars)
         else:
             raise ValueError(f"Unknown provider: {cfg.provider}")
     except Exception as e:

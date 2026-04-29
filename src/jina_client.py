@@ -43,16 +43,22 @@ HIGH_VALUE_SIGNALS = [
 
 @dataclass
 class JinaConfig:
-    api_key:       str   = ""
-    country_code:  str   = "AU"
-    urls_per_sku:  int   = 2
-    max_chars:     int   = 4000
-    timeout:       int   = 25
-    no_cache:      bool  = True
-    return_format: str   = "markdown"
-    search_only:   bool  = True
-    delay_between: float = 0.5
-    retry_on_few:  bool  = True
+    api_key:          str   = ""
+    country_code:     str   = "AU"
+    urls_per_sku:     int   = 2
+    max_chars:        int   = 4000
+    timeout:          int   = 25
+    no_cache:         bool  = True
+    return_format:    str   = "markdown"
+    search_only:      bool  = True
+    delay_between:    float = 0.5
+    retry_on_few:     bool  = True
+    # DOM-level content targeting — applied by Jina before markdown conversion.
+    # Far more reliable than post-hoc Python heuristics because they operate on
+    # the real DOM nodes, not on the resulting markdown line patterns.
+    target_selector:  str   = ""  # x-target-selector: only include matching elements
+    remove_selector:  str   = ""  # x-remove-selector: strip matching elements
+    use_readerlm:     bool  = False  # x-respond-with: readerlm-v2 (3x token cost, higher quality)
 
 
 def _base_headers(api_key: str = "") -> dict:
@@ -202,6 +208,18 @@ def fetch_page(url: str, cfg: JinaConfig) -> str | None:
     }
     if cfg.no_cache:
         headers["X-No-Cache"] = "true"
+    # DOM-level selectors — strip nav/footer/ads before Jina converts to markdown.
+    # x-target-selector tells Jina to return ONLY the matching elements.
+    # x-remove-selector strips elements unconditionally.
+    # Using both is valid: Jina applies remove first, then target.
+    if cfg.target_selector:
+        headers["X-Target-Selector"] = cfg.target_selector
+    if cfg.remove_selector:
+        headers["X-Remove-Selector"] = cfg.remove_selector
+    # ReaderLM-v2 is a dedicated SLM for HTML→markdown conversion. It produces
+    # significantly cleaner output on complex pages at 3x the token cost.
+    if cfg.use_readerlm:
+        headers["X-Respond-With"] = "readerlm-v2"
 
     req = urllib.request.Request(jina_url, headers=headers)
     try:

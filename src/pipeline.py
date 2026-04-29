@@ -19,8 +19,10 @@ class SKUResult:
     status:       str     # success | review | not_found | blocked | rate_limited | error
     data:         dict
     sources:      list
-    had_jsonld:   bool = False   # True if JSON-LD hint was available (regardless of quality)
+    had_jsonld:   bool = False
     error_msg:    str  = ""
+    debug_pages:  list = field(default_factory=list)
+    jsonld_hint:  dict = field(default_factory=dict)
 
 
 def _empty_row(original_row: dict, output_fields: list, flag: str) -> dict:
@@ -32,12 +34,13 @@ def _empty_row(original_row: dict, output_fields: list, flag: str) -> dict:
 
 
 def process_sku(
-    sku:           str,
-    original_row:  dict,
-    output_fields: list,
-    jina_cfg:      JinaConfig,
-    llm_cfg:       LLMConfig,
-    extra_term:    str = "",
+    sku:            str,
+    original_row:   dict,
+    output_fields:  list,
+    jina_cfg:       JinaConfig,
+    llm_cfg:        LLMConfig,
+    secondary_term: str  = "",
+    debug:          bool = False,
 ) -> SKUResult:
     """
     Process a single SKU end-to-end. Fully stateless — safe to call concurrently.
@@ -82,15 +85,28 @@ def process_sku(
         candidate = extract_jsonld(page["content"])
         if candidate and candidate.get("product_name"):
             jsonld_hint = candidate
-            break   # Use the first valid one as the hint
+            break
 
-    # 3. LLM extraction — always runs, JSON-LD injected as trusted metadata if available
+    # 3. Capture debug info when enabled (avoids memory cost on large runs)
+    debug_pages = []
+    if debug:
+        for page in pages:
+            debug_pages.append({
+                "url":           page["url"],
+                "cleaned_chars": len(page["content"]),
+                "cleaned_text":  page["content"],
+            })
+
+    # 4. LLM extraction — always runs, JSON-LD injected as trusted metadata if available
     try:
-        extracted = extract(sku, pages, output_fields, llm_cfg, jsonld_hint=jsonld_hint)
+        extracted = extract(sku, pages, output_fields, llm_cfg,
+                            jsonld_hint=jsonld_hint,
+                            max_chars=jina_cfg.max_chars)
     except Exception as e:
         return SKUResult(sku=sku, status="error",
                          data=_empty_row(original_row, output_fields, "ERROR"),
-                         sources=sources, error_msg=str(e))
+                         sources=sources, error_msg=str(e),
+                         debug_pages=debug_pages)
 
     enriched = {**original_row, **extracted}
     flag     = str(extracted.get("review_flag", "") or "").upper()
@@ -100,6 +116,8 @@ def process_sku(
         sku=sku, status=status,
         data=enriched, sources=sources,
         had_jsonld=(jsonld_hint is not None),
+        debug_pages=debug_pages,
+        jsonld_hint=jsonld_hint or {},
     )
 
 
@@ -108,19 +126,19 @@ def process_batch(
     output_fields: list,
     jina_cfg:      JinaConfig,
     llm_cfg:       LLMConfig,
-    max_workers:   int = 5,
+    max_workers:   int  = 5,
+    debug:         bool = False,
 ) -> list:
     """
-    Process a list of (sku, extra_term, original_row) tuples concurrently.
+    Process a list of (sku, secondary_term, original_row) tuples concurrently.
     secondary_term may be an empty string when no secondary column is configured.
     Returns results in completion order.
-    Called from the Streamlit main thread in fixed-size batches so the UI
-    can update between batches without threading complications.
+    debug=True populates SKUResult.debug_pages with the cleaned text per page.
     """
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
-            executor.submit(process_sku, sku, row, output_fields, jina_cfg, llm_cfg, secondary_term): sku
+            executor.submit(process_sku, sku, row, output_fields, jina_cfg, llm_cfg, secondary_term, debug): sku
             for sku, secondary_term, row in items
         }
         for future in as_completed(future_map):

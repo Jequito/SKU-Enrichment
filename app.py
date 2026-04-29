@@ -179,6 +179,31 @@ with st.sidebar:
         help="Passed to Google as the gl parameter — biases results to that locale.",
     )
 
+    restrict_language = st.toggle(
+        "Restrict to region's language",
+        value=True,
+        disabled=is_running,
+        key="restrict_language_toggle",
+        help=(
+            "Adds Google's lr=lang_X parameter to filter out foreign-language pages. "
+            "Recommended ON — without it, an Australia search for an MPN can still return "
+            "Polish, Czech, or German reseller pages that happen to match the code."
+        ),
+    )
+
+    restrict_country = st.toggle(
+        "Restrict to region only (strict)",
+        value=False,
+        disabled=is_running,
+        key="restrict_country_toggle",
+        help=(
+            "Adds Google's cr=country parameter — much stricter than the region bias. "
+            "OFF by default because Google's country detection occasionally excludes "
+            "legitimate manufacturer pages on .com domains. Turn ON when you need "
+            "results purely from your region's domains."
+        ),
+    )
+
     urls_per_sku = st.slider("URLs per product", 1, 5, 1, disabled=is_running,
                               help="Number of top-scored URLs to fetch and pass to the LLM. With exact-match Google searches the top hit is usually correct — 1 is enough most of the time.")
 
@@ -229,6 +254,7 @@ with st.sidebar:
     st.divider()
     debug_mode = st.toggle(
         "🔬 Debug mode", value=False, disabled=is_running,
+        key="debug_mode_toggle",
         help=(
             "Stores the cleaned text sent to the LLM for each product. "
             "Turn off for large batches — keeps everything in memory."
@@ -528,14 +554,16 @@ if is_running and st.session_state["work_queue"]:
     )
 
     search_cfg = SearchConfig(
-        serpapi_api_key = serpapi_api_key,
-        blocked_domains = user_blocked,
-        country_code    = country_code,
-        urls_per_sku    = urls_per_sku,
-        max_chars       = max_chars,
-        timeout         = timeout,
-        max_results     = max_results,
-        delay_between   = delay_between,
+        serpapi_api_key   = serpapi_api_key,
+        blocked_domains   = user_blocked,
+        country_code      = country_code,
+        restrict_language = restrict_language,
+        restrict_country  = restrict_country,
+        urls_per_sku      = urls_per_sku,
+        max_chars         = max_chars,
+        timeout           = timeout,
+        max_results       = max_results,
+        delay_between     = delay_between,
     )
     llm_cfg = LLMConfig(provider=provider_key, api_key=llm_api_key, model=llm_model)
 
@@ -789,10 +817,79 @@ if st.session_state["results"]:
     if debug_log:
         st.divider()
         st.markdown("### 🔬 Debug Log")
-        st.caption(
-            f"{len(debug_log)} products captured · "
-            f"Toggle **Debug mode** in the sidebar off to disable logging on future runs"
-        )
+
+        # Build a readable plaintext serialisation for download
+        from datetime import datetime
+        import json as _json
+
+        def _build_debug_txt(log: list, error_log: list) -> str:
+            lines = []
+            lines.append("=" * 70)
+            lines.append("SKU ENRICHMENT — DEBUG LOG")
+            lines.append(f"Generated:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            lines.append(f"Debug entries: {len(log)}")
+            lines.append(f"Error entries: {len(error_log)}")
+            lines.append("=" * 70)
+            lines.append("")
+
+            # Per-row debug entries
+            for i, entry in enumerate(log, 1):
+                lines.append("-" * 70)
+                lines.append(f"[{i}/{len(log)}] {entry.get('sku', '?')}")
+                lines.append(f"   status:      {entry.get('status', '?')}")
+                lines.append(f"   query used:  {entry.get('query_used') or '(none)'}")
+                lines.append(f"   JSON-LD hit: {'yes' if entry.get('jsonld_hit') else 'no'}")
+                if entry.get("error_msg"):
+                    lines.append(f"   error:       {entry['error_msg']}")
+                lines.append("")
+
+                hint = entry.get("jsonld_hint") or {}
+                if hint:
+                    lines.append("   JSON-LD hint passed to LLM:")
+                    for k, v in hint.items():
+                        lines.append(f"     {k}: {v}")
+                    lines.append("")
+
+                for j, page in enumerate(entry.get("pages", []), 1):
+                    lines.append(f"   Source {j}: {page.get('url', '?')}")
+                    lines.append(f"     chars:     {page.get('cleaned_chars', 0):,}")
+                    lines.append(f"     validates: {'yes' if page.get('validates') else 'no'}")
+                    lines.append("     content:")
+                    text = page.get("cleaned_text", "") or ""
+                    for tline in text.splitlines():
+                        lines.append(f"       {tline}")
+                    lines.append("")
+                lines.append("")
+
+            # Error log section
+            if error_log:
+                lines.append("=" * 70)
+                lines.append("ERROR LOG")
+                lines.append("=" * 70)
+                for e in error_log:
+                    lines.append(f"  [{e.get('kind', 'error')}] {e.get('sku', '?')}")
+                    lines.append(f"    {e.get('error', '')}")
+                    lines.append("")
+
+            return "\n".join(lines)
+
+        debug_txt = _build_debug_txt(debug_log, st.session_state.get("error_log", []))
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+        col_caption, col_download = st.columns([3, 1])
+        with col_caption:
+            st.caption(
+                f"{len(debug_log)} products captured · "
+                f"Toggle **Debug mode** in the sidebar off to disable logging on future runs"
+            )
+        with col_download:
+            st.download_button(
+                "⬇️ Download as .txt",
+                data=debug_txt.encode("utf-8"),
+                file_name=f"debug_log_{ts}.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
 
         for entry in debug_log:
             sku        = entry["sku"]

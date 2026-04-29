@@ -32,6 +32,15 @@ COUNTRY_LABELS = {
     "SG": "🇸🇬  Singapore",        "IN": "🇮🇳  India",
 }
 
+# Google `lr` language-restrict codes — filters out pages in other languages.
+# This is the cleanest fix for the "Polish/Czech reseller pages keep showing up
+# for AU searches" problem since SerpAPI's gl param only biases, doesn't filter.
+SERPAPI_LANGUAGES = {
+    "AU": "lang_en", "US": "lang_en", "UK": "lang_en",
+    "NZ": "lang_en", "CA": "lang_en", "SG": "lang_en", "IN": "lang_en",
+    "DE": "lang_de", "FR": "lang_fr", "JP": "lang_ja",
+}
+
 LOW_VALUE_DOMAINS = {
     "reddit.com", "quora.com", "pinterest.com", "instagram.com",
     "facebook.com", "twitter.com", "x.com", "youtube.com", "tiktok.com",
@@ -91,14 +100,16 @@ class IdentifierSet:
 
 @dataclass
 class SearchConfig:
-    serpapi_api_key: str   = ""
-    blocked_domains: tuple = ()      # extra user-blocked domains (substring match)
-    country_code:    str   = "AU"
-    urls_per_sku:    int   = 2
-    max_chars:       int   = 4000
-    timeout:         int   = 25
-    max_results:     int   = 10
-    delay_between:   float = 0.5
+    serpapi_api_key:    str   = ""
+    blocked_domains:    tuple = ()      # extra user-blocked domains (substring match)
+    country_code:       str   = "AU"
+    restrict_language:  bool  = True    # send lr=lang_X — filters foreign-language pages
+    restrict_country:   bool  = False   # send cr=country — stricter, can exclude legit pages
+    urls_per_sku:       int   = 2
+    max_chars:          int   = 4000
+    timeout:            int   = 25
+    max_results:        int   = 10
+    delay_between:      float = 0.5
 
 
 class RateLimitError(Exception):
@@ -135,6 +146,21 @@ def search(query: str, cfg: SearchConfig) -> list[dict]:
         "hl":      "en",
         "num":     min(cfg.max_results, 20),
     }
+
+    # Optional language restriction — filters out foreign-language pages.
+    # Without this, an AU search for "MPN-1234" can still surface Polish or
+    # German reseller pages that happen to mention the same code.
+    if cfg.restrict_language:
+        lr = SERPAPI_LANGUAGES.get(cfg.country_code.upper())
+        if lr:
+            params["lr"] = lr
+
+    # Optional country restriction — much stricter than gl. Google's "country
+    # of origin" detection can occasionally exclude legitimate pages, so this
+    # is OFF by default. Useful when you genuinely only want, say, AU domains.
+    if cfg.restrict_country:
+        cc = "GB" if cfg.country_code.upper() == "UK" else cfg.country_code.upper()
+        params["cr"] = f"country{cc}"
 
     try:
         with httpx.Client(timeout=cfg.timeout) as client:

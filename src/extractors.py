@@ -98,16 +98,24 @@ PRODUCT IDENTIFIERS:
 {_identifier_block(ids)}
 
 RULES:
-- Verify the source pages describe the SAME product as the identifiers above.
-  Match on the primary or fallback identifier appearing in the page content.
-  If the page appears to describe a different product, set review_flag to
-  REVIEW_NEEDED.
+- DO NOT return a fully empty result. Even if the page looks like a different
+  product variant, is in a non-English language, or only partially matches the
+  identifiers, extract whatever fields you reasonably can and set review_flag
+  to REVIEW_NEEDED so the user can verify manually.
+- If the page content is in a non-English language, translate description
+  fields (short_description, long_description) into English. Keep the original
+  product name as-is.
+- Verify the source pages describe the same product as the identifiers above.
+  Match on the primary or fallback identifier appearing in the page content
+  to determine confidence. A non-match means REVIEW_NEEDED, not empty output.
 - Only extract values explicitly present in the sources or trusted metadata —
   never invent data.
-- If a field is not found anywhere, return empty string "".
+- If an individual field is not found, return empty string "" for that field.
 - For specifications use pipe format: "Width: 60cm | Power: 7.4kW | Colour: Black"
 - If values conflict across sources, include both and set review_flag to REVIEW_NEEDED.
-- Set source_url to the most authoritative URL used.
+- ALWAYS populate source_url with the URL of the page that provided the most
+  data, even when review_flag is REVIEW_NEEDED. Never leave source_url empty
+  if any source page was provided.
 {hint_block}
 FIELDS TO EXTRACT:
 {field_list}

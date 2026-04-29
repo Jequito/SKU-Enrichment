@@ -1,9 +1,10 @@
 """
 src/extractors.py
 LLM extraction backends: OpenAI, Gemini, Claude.
-Supports an optional jsonld_hint dict — pre-extracted structured data that is
-injected into the prompt as trusted metadata, giving the LLM a head start
-without bypassing it entirely.
+
+Accepts an IdentifierSet so the prompt can include all known identifiers
+(SKU, manufacturer code, brand, product name) as match-anchors, plus an
+optional jsonld_hint dict for trusted structured-data context.
 """
 
 import json
@@ -38,29 +39,34 @@ SYSTEM_PROMPT = (
 )
 
 
+def _identifier_block(ids) -> str:
+    """Render IdentifierSet as a labelled block for the prompt."""
+    parts = []
+    if ids.sku:               parts.append(f"  SKU (internal):       {ids.sku}")
+    if ids.manufacturer_code: parts.append(f"  Manufacturer code:    {ids.manufacturer_code}")
+    if ids.brand:             parts.append(f"  Brand:                {ids.brand}")
+    if ids.product_name:      parts.append(f"  Product name (hint):  {ids.product_name}")
+    return "\n".join(parts) if parts else "  (none provided)"
+
+
 def build_prompt(
-    sku:          str,
+    ids,
     pages:        list,
     fields:       list,
     jsonld_hint:  dict | None = None,
     max_chars:    int = 0,
 ) -> str:
     """
-    Build the extraction prompt.
-    If jsonld_hint is provided it is injected as a TRUSTED METADATA block
-    before the page sources. The LLM uses it as a reliable starting point
-    and fills any missing or empty fields from the page content.
-
-    max_chars: if > 0, each page's content is additionally capped here.
-    Content is already cleaned and truncated by clean_content() in jina_client —
-    this cap is a safety net only. Pass 0 to trust the pre-cleaned length.
+    Build the extraction prompt. The IdentifierSet is rendered prominently
+    so the LLM can verify the page is about the correct product before
+    extracting fields. If the page describes a different product, the LLM
+    should set review_flag=REVIEW_NEEDED.
     """
     field_list = "\n".join(
         f'  "{f}": {FIELD_DEFINITIONS.get(f, f)}'
         for f in fields if f in FIELD_DEFINITIONS
     )
 
-    # Build source content — respect the configurable max_chars setting
     sources = ""
     for i, page in enumerate(pages, 1):
         text = page["content"]
@@ -76,7 +82,6 @@ def build_prompt(
 
     empty_json = json.dumps({f: "" for f in all_fields}, indent=2)
 
-    # Build optional trusted metadata block
     hint_block = ""
     if jsonld_hint:
         hint_block = f"""
@@ -87,14 +92,23 @@ Use the above values directly where they are populated.
 For any field that is empty or missing above, extract it from the sources below.
 """
 
-    return f"""Extract product data for SKU "{sku}" from the sources below.
+    primary_label = ids.display_label() if hasattr(ids, "display_label") else "(unknown)"
+
+    return f"""Extract product data for the product identified below.
+
+PRODUCT IDENTIFIERS:
+{_identifier_block(ids)}
 
 RULES:
-- Only extract values explicitly present in the sources or trusted metadata — never invent data
-- If a field is not found anywhere, return empty string ""
+- Verify the source pages describe the SAME product as the identifiers above.
+  Match on SKU or Manufacturer code appearing in the page content. If the page
+  appears to describe a different product, set review_flag to REVIEW_NEEDED.
+- Only extract values explicitly present in the sources or trusted metadata —
+  never invent data.
+- If a field is not found anywhere, return empty string "".
 - For specifications use pipe format: "Width: 60cm | Power: 7.4kW | Colour: Black"
-- If values conflict across sources, include both and set review_flag to REVIEW_NEEDED
-- Set source_url to the most authoritative URL used
+- If values conflict across sources, include both and set review_flag to REVIEW_NEEDED.
+- Set source_url to the most authoritative URL used.
 {hint_block}
 FIELDS TO EXTRACT:
 {field_list}
@@ -105,18 +119,14 @@ Return ONLY valid JSON — no markdown, no explanation:
 SOURCES:
 {sources}
 
-JSON output for SKU "{sku}":"""
+JSON output for "{primary_label}":"""
 
 
 def parse_json_response(text: str) -> dict:
     """
     Extract the first valid JSON object from LLM output.
-
-    Uses Python's raw JSON decoder to stop at the exact closing brace of the
-    first object — this correctly handles "chatty" models that append extra
-    text or a second JSON block after the primary response, both of which
-    would cause json.loads() to raise an 'Extra data' error if we naively
-    sliced from first { to last }.
+    Uses raw_decode so trailing/extra content after the object doesn't break
+    parsing on chatty models.
     """
     if not text:
         return {}
@@ -142,10 +152,10 @@ OPENAI_MODELS = [
     "gpt-3.5-turbo",
 ]
 
-def extract_openai(sku, pages, fields, api_key, model, jsonld_hint=None, max_chars=0):
+def extract_openai(ids, pages, fields, api_key, model, jsonld_hint=None, max_chars=0):
     from openai import OpenAI
     client   = OpenAI(api_key=api_key)
-    prompt   = build_prompt(sku, pages, fields, jsonld_hint, max_chars=max_chars)
+    prompt   = build_prompt(ids, pages, fields, jsonld_hint, max_chars=max_chars)
     response = client.chat.completions.create(
         model=model,
         messages=[
@@ -167,20 +177,18 @@ GEMINI_MODELS = [
     "gemini-1.5-pro",
 ]
 
-def extract_gemini(sku, pages, fields, api_key, model, jsonld_hint=None, max_chars=0):
+def extract_gemini(ids, pages, fields, api_key, model, jsonld_hint=None, max_chars=0):
     import google.generativeai as genai
 
-    # configure() mutates global SDK state — must be serialised across threads
     with _gemini_lock:
         genai.configure(api_key=api_key)
 
     m        = genai.GenerativeModel(model)
-    prompt   = f"{SYSTEM_PROMPT}\n\n{build_prompt(sku, pages, fields, jsonld_hint, max_chars=max_chars)}"
+    prompt   = f"{SYSTEM_PROMPT}\n\n{build_prompt(ids, pages, fields, jsonld_hint, max_chars=max_chars)}"
     response = m.generate_content(
         prompt,
         generation_config=genai.GenerationConfig(temperature=0, max_output_tokens=2048),
     )
-    # Gemini safety filters can block responses — .text raises ValueError on blocked content
     try:
         text = response.text
     except ValueError:
@@ -200,10 +208,10 @@ CLAUDE_MODELS = [
     "claude-opus-4-5",
 ]
 
-def extract_claude(sku, pages, fields, api_key, model, jsonld_hint=None, max_chars=0):
+def extract_claude(ids, pages, fields, api_key, model, jsonld_hint=None, max_chars=0):
     import anthropic
     client   = anthropic.Anthropic(api_key=api_key)
-    prompt   = build_prompt(sku, pages, fields, jsonld_hint, max_chars=max_chars)
+    prompt   = build_prompt(ids, pages, fields, jsonld_hint, max_chars=max_chars)
     response = client.messages.create(
         model=model,
         max_tokens=2048,
@@ -223,20 +231,14 @@ class LLMConfig:
 
 
 def extract(
-    sku:         str,
+    ids,
     pages:       list,
     fields:      list,
     cfg:         LLMConfig,
     jsonld_hint: dict | None = None,
     max_chars:   int = 0,
 ) -> dict:
-    """
-    Unified extraction interface.
-    jsonld_hint: optional pre-extracted JSON-LD data injected into the prompt
-    as trusted metadata — the LLM uses it as a foundation and fills gaps
-    from the page content. Always goes through the LLM regardless.
-    max_chars: passed to build_prompt to cap each page's content slice.
-    """
+    """Unified extraction interface."""
     if not pages:
         return {f: "" for f in fields}
 
@@ -247,11 +249,11 @@ def extract(
 
     try:
         if cfg.provider == "openai":
-            result = extract_openai(sku, pages, all_fields, cfg.api_key, cfg.model, jsonld_hint, max_chars)
+            result = extract_openai(ids, pages, all_fields, cfg.api_key, cfg.model, jsonld_hint, max_chars)
         elif cfg.provider == "gemini":
-            result = extract_gemini(sku, pages, all_fields, cfg.api_key, cfg.model, jsonld_hint, max_chars)
+            result = extract_gemini(ids, pages, all_fields, cfg.api_key, cfg.model, jsonld_hint, max_chars)
         elif cfg.provider == "claude":
-            result = extract_claude(sku, pages, all_fields, cfg.api_key, cfg.model, jsonld_hint, max_chars)
+            result = extract_claude(ids, pages, all_fields, cfg.api_key, cfg.model, jsonld_hint, max_chars)
         else:
             raise ValueError(f"Unknown provider: {cfg.provider}")
     except Exception as e:

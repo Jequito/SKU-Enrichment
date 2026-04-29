@@ -1,26 +1,30 @@
 # SKU Product Enrichment
 
 Bulk enrich SKU / product codes with descriptions, specifications and metadata.
-Searches Google via Jina AI, fetches product pages, cleans content, and extracts structured data using your choice of LLM.
+Searches DuckDuckGo (no API key), fetches product pages directly, and extracts
+structured data using your choice of LLM.
 
 ## Features
 
-- 📂 **Upload** CSV or Excel file with any column layout
-- 🔍 **Searches** Google exactly for each SKU using Jina AI (`s.jina.ai`)
-- 🌏 **Country targeting** — Australia default, 10 countries supported (via `&gl=` and `&location=` params — not search keywords)
-- 📄 **Fetches** product pages via Jina Reader (`r.jina.ai`) — clean markdown
-- 🧹 **Content cleaning** — strips mega menus, footers, cookie notices before LLM sees the page
-- 📐 **JSON-LD hint** — injects structured page metadata into the LLM prompt as trusted data for higher accuracy
-- ⚡ **Concurrent processing** — configurable workers (1–20) for large batches
-- 🤖 **Extracts** with OpenAI, Gemini, or Claude
-- 📊 **Live table** updates as batches complete
-- ⬇️ **Download** enriched results as CSV or colour-coded Excel
+- 📂 Upload CSV or Excel file with any column layout
+- 🔍 **No search API** — uses DuckDuckGo via the `ddgs` library
+- 🌐 **No fetch API** — direct `httpx` + `trafilatura` content extraction
+- 🧬 **Cascade search** — tries Manufacturer Code, SKU, Brand, and Product Name
+  combinations to handle the case where SKU and manufacturer code differ
+- ✅ **Content validation** — flags rows where the fetched page doesn't contain
+  any of your identifier codes (suggests the wrong product was matched)
+- 📐 **JSON-LD hint** — extracts structured product data from page HTML and
+  passes it to the LLM as trusted metadata
+- ⚡ Concurrent processing with configurable workers (1–20)
+- ⏸ **Working pause/stop** — runs one batch per Streamlit rerun so the buttons
+  always respond
+- 🤖 Extracts with OpenAI, Gemini, or Claude
+- 📊 Live table updates as batches complete
+- ⬇️ Download as CSV or colour-coded Excel
 
 ## Quick Start
 
 ```bash
-git clone <your-repo-url>
-cd sku-enrichment
 pip install -r requirements.txt
 streamlit run app.py
 ```
@@ -29,45 +33,40 @@ Open http://localhost:8501 in your browser.
 
 ## API Keys Required
 
+Only an LLM key — no search or fetch keys.
+
 | Key | Where to get | Cost |
 |-----|-------------|------|
-| **LLM key (choose one)** | | |
-| OpenAI | platform.openai.com | Pay per use — gpt-4o-mini cheapest |
-| Gemini | aistudio.google.com | Free tier + pay per use — gemini-2.0-flash cheapest |
-| Claude | console.anthropic.com | Pay per use — claude-haiku cheapest |
-| **Jina API Key** | jina.ai/reader | Free tier — optional but strongly recommended for large batches |
+| Gemini (recommended) | aistudio.google.com | Generous free tier — gemini-2.0-flash |
+| OpenAI               | platform.openai.com | Pay per use — gpt-4o-mini cheapest |
+| Claude               | console.anthropic.com | Pay per use — claude-haiku cheapest |
 
-## Cost Estimates at 10,000 SKUs
+## Identifier Cascade
 
-| Model | Estimated Cost |
-|-------|---------------|
-| gemini-2.0-flash | ~$1–3 |
-| claude-haiku-4-5 | ~$5–8 |
-| gpt-4o-mini | ~$8–12 |
-| gpt-4o | ~$100+ |
+For each row, the tool tries up to five queries in order, stopping at the first
+that returns results matching your identifier codes:
 
-Jina fetching is free with your API key regardless of volume.
+1. `"{Manufacturer Code}"` quoted
+2. `"{SKU}"` quoted
+3. `"{Manufacturer Code}" {Brand}`
+4. `"{SKU}" {Brand}`
+5. `{Product Name} {Brand}` — last-resort wide search
 
-## Large Batch Guidance
+A "match" means the SKU or manufacturer code appears in the result's URL,
+title, or snippet. After fetching, content is also checked for those codes —
+if neither appears in the page text, the row is flagged `REVIEW_NEEDED`.
 
-- Run **locally** for batches over 5,000 SKUs — Streamlit Cloud sessions may time out
-- Use **5–10 concurrent workers** for best speed/stability balance
-- Estimated runtime at 5 workers: ~2–3 hours for 10k SKUs
-- Keep browser tab active — progress lives in the session
+## Rate Limit Notes
 
-## Jina AI Settings
+DuckDuckGo throttles. The hard caps are not officially documented, but in
+practice:
 
-| Setting | Description |
-|---------|-------------|
-| API Key | Higher rate limits — free at jina.ai/reader |
-| Search Country | Country-targeted Google results via `&gl=` and `&location=` params |
-| URLs per SKU | 1–5 pages to cross-reference (2 recommended) |
-| Max chars per page | Applied after content cleaning (4,000 default) |
-| Request timeout | Per-request timeout in seconds |
-| Page return format | `markdown` recommended for LLM extraction |
-| Bypass cache | Always fetch fresh content |
-| Retry on few results | Retry with `specifications` appended if < 2 results |
-| Delay between fetches | Pause between URL fetches within one SKU |
+- 3–5 concurrent workers is reliable
+- 6–10 workers usually works with a 1–2 second delay between batches
+- Above 10 workers you'll see frequent rate-limit errors
+
+If you hit a limit the run auto-pauses and you can resume after waiting a few
+minutes — already-completed work is preserved.
 
 ## Output Fields
 
@@ -84,19 +83,19 @@ Jina fetching is free with your API key regardless of volume.
 | country_of_origin | Country of manufacture |
 | source_url | Primary source URL |
 | confidence_score | High / Medium / Low |
-| review_flag | VERIFIED / REVIEW_NEEDED / NOT_FOUND / ERROR |
+| review_flag | VERIFIED / REVIEW_NEEDED / NOT_FOUND / BLOCKED / RATE_LIMITED / ERROR |
 
 ## Project Structure
 
 ```
 sku-enrichment/
-├── app.py                   # Streamlit UI
+├── app.py                   # Streamlit UI + one-batch-per-rerun pipeline driver
 ├── requirements.txt
 ├── README.md
 └── src/
-    ├── jina_client.py       # Jina search + fetch
-    ├── content_cleaner.py   # Nav stripping + JSON-LD extraction
+    ├── search_client.py     # DuckDuckGo search + httpx fetch + trafilatura
+    ├── content_cleaner.py   # JSON-LD extraction
     ├── extractors.py        # OpenAI / Gemini / Claude
     ├── file_handler.py      # CSV + Excel I/O
-    └── pipeline.py          # Per-SKU orchestration + concurrency
+    └── pipeline.py          # Per-product orchestration + concurrency
 ```

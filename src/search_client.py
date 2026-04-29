@@ -205,33 +205,76 @@ def search(query: str, cfg: SearchConfig) -> list[dict]:
     return results
 
 
+def _has_relevant_match(results: list[dict], identifier: str) -> bool:
+    """
+    Did Google actually find what we asked for, or just adjacent junk?
+
+    Uses normalised matching (strips hyphens, spaces, punctuation, lowercases)
+    against the URL + title + snippet of each result. If at least one result
+    contains the normalised identifier as a substring, we consider the search
+    "relevant" and don't trigger the fallback. Otherwise the primary search
+    is treated as a miss even though it returned hits.
+
+    The normalisation lets 'LDS-MAUI5' match 'LDS-MAUI-5-W-SUB' but reject
+    pages that only mention the brand without the specific model code.
+    """
+    norm_id = _normalise_for_match(identifier)
+    if not norm_id:
+        return True   # nothing to check against — assume relevant
+    for r in results:
+        haystack = " ".join([
+            r.get("url", "") or "",
+            r.get("title", "") or "",
+            r.get("snippet", "") or "",
+        ])
+        if norm_id in _normalise_for_match(haystack):
+            return True
+    return False
+
+
 def search_for_product(ids: IdentifierSet, cfg: SearchConfig) -> tuple[list[dict], str]:
     """
-    Two-stage exact-match search:
-      1. `"primary_value"` — quoted Google search via SerpAPI
-      2. `"fallback_value"` — only runs if stage 1 returned zero results
+    Two-stage exact-match search with relevance trigger:
 
-    Returns (results, query_used). Empty results means neither column found
-    anything on Google — the row is genuinely not findable, no further
-    fallbacks are tried.
+      1. `"primary_value"` — quoted Google search via SerpAPI.
+         If results are returned AND at least one of them mentions the
+         primary identifier in URL/title/snippet (after hyphen-insensitive
+         normalisation), use them.
+
+      2. `"fallback_value"` — runs when stage 1 returned zero results OR
+         when stage 1 returned results that don't actually contain the
+         primary identifier (Google's quote-handling sometimes loosens up
+         on rare codes and returns adjacent products).
+
+    Returns (results, query_used). If both stages fail the relevance bar but
+    the primary returned *something*, those weak results are returned anyway
+    so the row gets at least one fetch attempt.
     """
     primary_val  = (ids.primary or "").strip()
     fallback_val = (ids.fallback or "").strip()
 
+    primary_results: list[dict] = []
+    primary_query   = ""
+
     # Stage 1: primary
     if primary_val:
-        query = f'"{primary_val}"'
-        results = search(query, cfg)
-        if results:
-            return results, query
+        primary_query = f'"{primary_val}"'
+        primary_results = search(primary_query, cfg)
+        if primary_results and _has_relevant_match(primary_results, primary_val):
+            return primary_results, primary_query
 
-    # Stage 2: fallback (only if primary was empty or returned nothing)
+    # Stage 2: fallback — runs on either zero results or weak/irrelevant results
     if fallback_val and fallback_val.lower() != primary_val.lower():
-        query = f'"{fallback_val}"'
-        results = search(query, cfg)
-        if results:
-            return results, query
+        fallback_query  = f'"{fallback_val}"'
+        fallback_results = search(fallback_query, cfg)
+        if fallback_results:
+            return fallback_results, fallback_query
 
+    # Fallback didn't help either. If primary returned weak-but-nonempty
+    # results, return them — better to attempt a fetch on a borderline page
+    # than mark the row NOT_FOUND when Google did surface something.
+    if primary_results:
+        return primary_results, primary_query
     return [], ""
 
 

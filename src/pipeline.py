@@ -23,15 +23,17 @@ from .extractors import LLMConfig, extract
 
 @dataclass
 class SKUResult:
-    sku:          str
-    status:       str   # success | review | not_found | blocked | rate_limited | error
-    data:         dict
-    sources:      list
-    had_jsonld:   bool = False
-    error_msg:    str  = ""
-    debug_pages:  list = field(default_factory=list)
-    jsonld_hint:  dict = field(default_factory=dict)
-    query_used:   str  = ""
+    sku:            str
+    status:         str   # success | review | not_found | blocked | rate_limited | error
+    data:           dict
+    sources:        list
+    had_jsonld:     bool = False
+    error_msg:      str  = ""
+    debug_pages:    list = field(default_factory=list)
+    jsonld_hint:    dict = field(default_factory=dict)
+    query_used:     str  = ""
+    primary_value:  str  = ""    # original Primary column value for this row
+    fallback_value: str  = ""    # original Fallback column value for this row
 
 
 def _empty_row(original_row: dict, output_fields: list, flag: str) -> dict:
@@ -52,7 +54,9 @@ def process_product(
 ) -> SKUResult:
     """Process a single product end-to-end. Stateless — safe under threading."""
 
-    sku_label = ids.display_label()
+    sku_label  = ids.display_label()
+    primary_v  = (ids.primary or "").strip()
+    fallback_v = (ids.fallback or "").strip()
 
     # 1. Search + fetch
     try:
@@ -60,11 +64,62 @@ def process_product(
     except RateLimitError as e:
         return SKUResult(sku=sku_label, status="rate_limited",
                          data=_empty_row(original_row, output_fields, "RATE_LIMITED"),
-                         sources=[], error_msg=str(e))
+                         sources=[], error_msg=str(e),
+                         primary_value=primary_v, fallback_value=fallback_v)
     except Exception as e:
         return SKUResult(sku=sku_label, status="error",
                          data=_empty_row(original_row, output_fields, "ERROR"),
-                         sources=[], error_msg=str(e))
+                         sources=[], error_msg=str(e),
+                         primary_value=primary_v, fallback_value=fallback_v)
+
+    # 1b. Post-fetch fallback retry. Triggers when the first attempt came back
+    # blocked/not-found AND the winning query was the primary (which means the
+    # search-stage relevance trigger didn't already fire the fallback). Catches
+    # cases like: Google found a relevant URL, but it was on your blocklist /
+    # returned 403 / was a JS-only page. Without this, those rows would just
+    # die as BLOCKED even when the user has a perfectly good fallback column.
+    used_primary_query = (
+        bool(primary_v) and
+        query_used.strip().strip('"').lower() == primary_v.lower()
+    )
+    fallback_distinct = (
+        bool(fallback_v) and
+        fallback_v.lower() != primary_v.lower()
+    )
+    if (fetch_status in ("blocked", "not_found")
+            and used_primary_query
+            and fallback_distinct):
+        fallback_only = IdentifierSet(primary=fallback_v, fallback="")
+        try:
+            pages_fb, status_fb, query_fb, errors_fb = fetch_pages_for_product(
+                fallback_only, search_cfg
+            )
+            if status_fb == "ok" and pages_fb:
+                # Fallback rescued the row — adopt its results, but combine
+                # the failure errors from attempt 1 so the user can still
+                # see what went wrong with the primary.
+                pages         = pages_fb
+                fetch_status  = "ok"
+                query_used    = query_fb
+                fetch_errors  = (fetch_errors or []) + (errors_fb or [])
+            else:
+                # Fallback also didn't yield pages — record both attempts'
+                # failures in fetch_errors so the diagnostic panel shows the
+                # full journey.
+                fetch_errors = (fetch_errors or []) + [
+                    {"url": "", "error":
+                     f"Post-fetch fallback '{fallback_v}' also returned {status_fb}"}
+                ] + (errors_fb or [])
+        except RateLimitError as e:
+            fetch_errors = (fetch_errors or []) + [
+                {"url": "", "error": f"Fallback search rate-limited: {e}"}
+            ]
+        except BackendConfigError:
+            raise
+        except Exception as e:
+            fetch_errors = (fetch_errors or []) + [
+                {"url": "", "error": f"Fallback search error: {type(e).__name__}: {e}"}
+            ]
 
     if fetch_status in ("not_found", "blocked", "rate_limited"):
         # Build a readable summary of why fetches failed so the user sees
@@ -81,7 +136,8 @@ def process_product(
             block_msg = " | ".join(parts)
         return SKUResult(sku=sku_label, status=fetch_status,
                          data=_empty_row(original_row, output_fields, fetch_status.upper()),
-                         sources=[], error_msg=block_msg, query_used=query_used)
+                         sources=[], error_msg=block_msg, query_used=query_used,
+                         primary_value=primary_v, fallback_value=fallback_v)
 
     sources = [p["url"] for p in pages]
 
@@ -120,7 +176,8 @@ def process_product(
         return SKUResult(sku=sku_label, status="error",
                          data=_empty_row(original_row, output_fields, "ERROR"),
                          sources=sources, error_msg=str(e),
-                         debug_pages=debug_pages, query_used=query_used)
+                         debug_pages=debug_pages, query_used=query_used,
+                         primary_value=primary_v, fallback_value=fallback_v)
 
     # If validation failed, override the flag to REVIEW_NEEDED — content may
     # be about a different product even if extraction looked clean.
@@ -154,6 +211,7 @@ def process_product(
         debug_pages=debug_pages,
         jsonld_hint=jsonld_hint or {},
         query_used=query_used,
+        primary_value=primary_v, fallback_value=fallback_v,
     )
 
 
@@ -185,5 +243,7 @@ def process_batch(
                     sku=ids.display_label(), status="error",
                     data={"review_flag": "ERROR", "_error": str(e)},
                     sources=[],
+                    primary_value=(ids.primary or "").strip(),
+                    fallback_value=(ids.fallback or "").strip(),
                 ))
     return results

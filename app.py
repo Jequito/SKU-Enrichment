@@ -636,13 +636,15 @@ if is_running and st.session_state["work_queue"]:
 
         if debug_mode and result.debug_pages:
             st.session_state["debug_log"].append({
-                "sku":         result.sku,
-                "status":      result.status,
-                "pages":       result.debug_pages,
-                "jsonld_hit":  result.had_jsonld,
-                "jsonld_hint": result.jsonld_hint,
-                "query_used":  result.query_used,
-                "error_msg":   result.error_msg,
+                "sku":            result.sku,
+                "primary_value":  result.primary_value,
+                "fallback_value": result.fallback_value,
+                "status":         result.status,
+                "pages":          result.debug_pages,
+                "jsonld_hit":     result.had_jsonld,
+                "jsonld_hint":    result.jsonld_hint,
+                "query_used":     result.query_used,
+                "error_msg":      result.error_msg,
             })
 
     st.session_state["completed_count"] += len(batch)
@@ -836,11 +838,24 @@ if st.session_state["results"]:
             for i, entry in enumerate(log, 1):
                 lines.append("-" * 70)
                 lines.append(f"[{i}/{len(log)}] {entry.get('sku', '?')}")
-                lines.append(f"   status:      {entry.get('status', '?')}")
-                lines.append(f"   query used:  {entry.get('query_used') or '(none)'}")
-                lines.append(f"   JSON-LD hit: {'yes' if entry.get('jsonld_hit') else 'no'}")
+                lines.append(f"   primary value:   {entry.get('primary_value') or '(empty)'}")
+                lines.append(f"   fallback value:  {entry.get('fallback_value') or '(empty)'}")
+                lines.append(f"   query used:      {entry.get('query_used') or '(none)'}")
+                # Indicate which column actually triggered the winning query
+                pv = (entry.get('primary_value') or '').strip().lower()
+                fv = (entry.get('fallback_value') or '').strip().lower()
+                qu = (entry.get('query_used') or '').strip().strip('"').lower()
+                if qu and qu == pv:
+                    src = "primary"
+                elif qu and qu == fv:
+                    src = "fallback (primary returned no relevant results)"
+                else:
+                    src = "?"
+                lines.append(f"   query source:    {src}")
+                lines.append(f"   status:          {entry.get('status', '?')}")
+                lines.append(f"   JSON-LD hit:     {'yes' if entry.get('jsonld_hit') else 'no'}")
                 if entry.get("error_msg"):
-                    lines.append(f"   error:       {entry['error_msg']}")
+                    lines.append(f"   error:           {entry['error_msg']}")
                 lines.append("")
 
                 hint = entry.get("jsonld_hint") or {}
@@ -910,6 +925,22 @@ if st.session_state["results"]:
             ):
                 if entry.get("error_msg"):
                     st.error(f"**LLM error:** {entry['error_msg']}")
+
+                # Show both column values + which one the winning query came from
+                pv = (entry.get("primary_value") or "").strip()
+                fv = (entry.get("fallback_value") or "").strip()
+                qu = (query or "").strip().strip('"')
+                if qu and qu.lower() == pv.lower():
+                    fired = "**primary** column"
+                elif qu and qu.lower() == fv.lower():
+                    fired = "**fallback** column (primary returned no relevant matches)"
+                else:
+                    fired = "—"
+                st.markdown(
+                    f"**Primary value:** `{pv or '(empty)'}` &nbsp;·&nbsp; "
+                    f"**Fallback value:** `{fv or '(empty)'}` &nbsp;·&nbsp; "
+                    f"**Query fired from:** {fired}"
+                )
                 if query:
                     st.markdown(f"**Search query used:** `{query}`")
                 if hint:

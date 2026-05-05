@@ -2,9 +2,10 @@
 src/search_client.py
 SerpAPI Google search + direct httpx fetch + trafilatura content extraction.
 
-Strategy: exact-match Google search on a user-mapped Primary column. If that
-returns zero results, retry on a user-mapped Fallback column. Both column
-mappings are user-configured in the sidebar — no hardcoded priorities.
+Strategy: per-row Google search on a user-mapped Primary column, with optional
+exact-match (quoted) phrasing. If that returns no relevant hits, retry on a
+user-mapped Fallback column. Both column mappings and both quoting decisions
+are user-configured in the sidebar.
 
 Per row: 1 SerpAPI query when the primary works, 2 when it doesn't.
 """
@@ -73,8 +74,8 @@ _BROWSER_HEADERS = {
 class IdentifierSet:
     """Per-row identifier values pulled from the user's mapped columns.
 
-    primary  is searched first (exact-quoted Google).
-    fallback is searched only if the primary search returns zero results.
+    primary  is searched first.
+    fallback is searched only if the primary search returns no relevant hits.
     Both are also passed to the LLM as match anchors and used for content
     validation.
     """
@@ -105,6 +106,14 @@ class SearchConfig:
     country_code:       str   = "AU"
     restrict_language:  bool  = True    # send lr=lang_X — filters foreign-language pages
     restrict_country:   bool  = False   # send cr=country — stricter, can exclude legit pages
+    # Exact-match toggles. When True the corresponding term is wrapped in
+    # double quotes before being sent to Google ("ABC123"), which forces a
+    # verbatim match. Turn OFF for codes whose formatting varies across sites
+    # — e.g. an SKU stored as "WVE-T60S" in the user's data but rendered as
+    # "WVE T60 S" or "WVET60S" on retailer pages. Without quotes Google is
+    # free to do its usual loosening (stemming, ignored hyphens, synonyms).
+    primary_exact:      bool  = True
+    fallback_exact:     bool  = True
     urls_per_sku:       int   = 2
     max_chars:          int   = 4000
     timeout:            int   = 25
@@ -232,19 +241,28 @@ def _has_relevant_match(results: list[dict], identifier: str) -> bool:
     return False
 
 
+def _format_query(value: str, exact: bool) -> str:
+    """Quote the value when exact-match is requested; otherwise pass through."""
+    v = (value or "").strip()
+    if not v:
+        return ""
+    return f'"{v}"' if exact else v
+
+
 def search_for_product(ids: IdentifierSet, cfg: SearchConfig) -> tuple[list[dict], str]:
     """
-    Two-stage exact-match search with relevance trigger:
+    Two-stage search with optional per-stage exact-match (quoted) phrasing
+    and a relevance trigger:
 
-      1. `"primary_value"` — quoted Google search via SerpAPI.
-         If results are returned AND at least one of them mentions the
-         primary identifier in URL/title/snippet (after hyphen-insensitive
+      1. Primary search via SerpAPI. The query is quoted iff cfg.primary_exact
+         is True. If results are returned AND at least one of them mentions
+         the primary identifier in URL/title/snippet (after hyphen-insensitive
          normalisation), use them.
 
-      2. `"fallback_value"` — runs when stage 1 returned zero results OR
+      2. Fallback search — runs when stage 1 returned zero results OR
          when stage 1 returned results that don't actually contain the
-         primary identifier (Google's quote-handling sometimes loosens up
-         on rare codes and returns adjacent products).
+         primary identifier. The query is quoted iff cfg.fallback_exact
+         is True.
 
     Returns (results, query_used). If both stages fail the relevance bar but
     the primary returned *something*, those weak results are returned anyway
@@ -258,14 +276,14 @@ def search_for_product(ids: IdentifierSet, cfg: SearchConfig) -> tuple[list[dict
 
     # Stage 1: primary
     if primary_val:
-        primary_query = f'"{primary_val}"'
+        primary_query   = _format_query(primary_val, cfg.primary_exact)
         primary_results = search(primary_query, cfg)
         if primary_results and _has_relevant_match(primary_results, primary_val):
             return primary_results, primary_query
 
     # Stage 2: fallback — runs on either zero results or weak/irrelevant results
     if fallback_val and fallback_val.lower() != primary_val.lower():
-        fallback_query  = f'"{fallback_val}"'
+        fallback_query   = _format_query(fallback_val, cfg.fallback_exact)
         fallback_results = search(fallback_query, cfg)
         if fallback_results:
             return fallback_results, fallback_query
@@ -372,7 +390,14 @@ def fetch_page(url: str, cfg: SearchConfig) -> dict:
     )
 
     used_recall = False
-    if not body or len(body) < 200:
+    # Threshold raised from 200 → 800. Many product pages return 200–500 chars
+    # of specs, headings and footer text in precision mode while the actual
+    # description paragraph is classified as boilerplate and dropped. The old
+    # 200-char threshold meant those pages bypassed recall entirely, leaving
+    # the LLM with specs but no description. 800 is empirical — most genuine
+    # product pages clear it once descriptions are included; spec-only stubs
+    # don't, which is exactly the case where recall mode helps.
+    if not body or len(body) < 800:
         recall_body = trafilatura.extract(
             html,
             include_links=False,
@@ -381,7 +406,10 @@ def fetch_page(url: str, cfg: SearchConfig) -> dict:
             output_format="markdown",
             favor_recall=True,
         )
-        if recall_body and len(recall_body) >= 200:
+        # Defensive: only adopt recall if it's strictly longer than precision.
+        # In rare cases recall returns less (different boilerplate scoring),
+        # in which case precision's cleaner output is still preferable.
+        if recall_body and len(recall_body) > len(body or ""):
             body = recall_body
             used_recall = True
 

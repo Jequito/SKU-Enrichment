@@ -204,39 +204,6 @@ with st.sidebar:
         ),
     )
 
-    # ── Exact-match toggles ──
-    # By default both queries are wrapped in double quotes for verbatim matching.
-    # Turn either off when the corresponding code is formatted differently across
-    # sites (e.g. an SKU you store as "WVE-T60S" but vendors render as "WVE T60 S"
-    # or "WVET60S"). Without quotes Google does its usual loosening — handy for
-    # those cases, but it can also pull in adjacent products. Per-stage toggles
-    # let you pick: e.g. quote the strict manufacturer code in Primary, leave the
-    # internal SKU in Fallback unquoted for tolerance.
-    primary_exact = st.toggle(
-        "Primary: exact match (quoted)",
-        value=True,
-        disabled=is_running,
-        key="primary_exact_toggle",
-        help=(
-            "Wraps the Primary search in double quotes to force Google to match "
-            "the value verbatim. ON by default for unambiguous codes. Turn OFF "
-            "when the code is formatted differently across sites — e.g. you "
-            "store 'WVE-T60S' but pages render it as 'WVE T60 S'."
-        ),
-    )
-
-    fallback_exact = st.toggle(
-        "Fallback: exact match (quoted)",
-        value=True,
-        disabled=is_running,
-        key="fallback_exact_toggle",
-        help=(
-            "Same as the Primary toggle but applied to the Fallback search. "
-            "Turn OFF if your fallback column holds values whose formatting "
-            "varies across vendors."
-        ),
-    )
-
     urls_per_sku = st.slider("URLs per product", 1, 5, 1, disabled=is_running,
                               help="Number of top-scored URLs to fetch and pass to the LLM. With exact-match Google searches the top hit is usually correct — 1 is enough most of the time.")
 
@@ -396,6 +363,12 @@ with col_config:
     st.markdown("### 🏷️ Identifier Columns")
     st.caption("Map both columns. Primary is searched first, Fallback runs if the primary search returns nothing useful — or if extraction comes back description-empty.")
 
+    # Defaults so SearchConfig has values even before the file is uploaded.
+    # Streamlit's `key=` makes the toggles below remember the user's choice
+    # across reruns regardless of which branch we hit here.
+    primary_exact  = True
+    fallback_exact = True
+
     if columns:
         # Auto-detect: manufacturer/product code typically goes in Primary,
         # internal SKU in Fallback. User can flip either dropdown.
@@ -413,7 +386,25 @@ with col_config:
             columns,
             index=_auto_index(columns, primary_hints),
             disabled=is_running,
-            help="Searched first. Quoted iff the 'Primary: exact match' toggle is on. Typically your Product Code / MPN.",
+            help="Searched first. Typically your Product Code / MPN.",
+        )
+        # Per-column exact-match toggle. By default the value is wrapped in
+        # double quotes for a verbatim Google match. Turn OFF when this
+        # column's values are formatted differently across vendor sites
+        # (e.g. you store 'WVE-T60S' but pages render it as 'WVE T60 S').
+        # Without quotes Google does its usual loosening — handy for those
+        # cases, but it can also pull in adjacent products.
+        primary_exact = st.toggle(
+            "Exact match (quoted)",
+            value=True,
+            disabled=is_running,
+            key="primary_exact_toggle",
+            help=(
+                "Wraps the Primary search in double quotes to force Google to "
+                "match the value verbatim. ON by default for unambiguous codes. "
+                "Turn OFF when the code is formatted differently across sites — "
+                "e.g. you store 'WVE-T60S' but pages render it as 'WVE T60 S'."
+            ),
         )
 
         fallback_options = [c for c in columns if c != primary_column]
@@ -422,7 +413,18 @@ with col_config:
             fallback_options,
             index=_auto_index(fallback_options, fallback_hints),
             disabled=is_running,
-            help="Used as a fallback when the primary returns nothing relevant, fetches all fail, or extraction comes back empty. Typically your internal SKU.",
+            help="Used when the primary returns nothing relevant, fetches all fail, or extraction comes back description-empty. Typically your internal SKU.",
+        )
+        fallback_exact = st.toggle(
+            "Exact match (quoted)",
+            value=True,
+            disabled=is_running,
+            key="fallback_exact_toggle",
+            help=(
+                "Same as the Primary toggle, applied to the Fallback search. "
+                "Turn OFF if your fallback column holds values whose formatting "
+                "varies across vendors."
+            ),
         )
     else:
         primary_column  = "— upload a file first —"

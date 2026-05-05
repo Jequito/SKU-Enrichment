@@ -35,6 +35,7 @@ class SKUResult:
     query_used:     str  = ""
     primary_value:  str  = ""    # original Primary column value for this row
     fallback_value: str  = ""    # original Fallback column value for this row
+    category_value: str  = ""    # original Category column value for this row (if mapped)
 
 
 def _empty_row(original_row: dict, output_fields: list, flag: str) -> dict:
@@ -74,8 +75,9 @@ def process_product(
     """Process a single product end-to-end. Stateless — safe under threading."""
 
     sku_label  = ids.display_label()
-    primary_v  = (ids.primary or "").strip()
+    primary_v  = (ids.primary  or "").strip()
     fallback_v = (ids.fallback or "").strip()
+    category_v = (ids.category or "").strip()
 
     # 1. Search + fetch
     try:
@@ -84,12 +86,14 @@ def process_product(
         return SKUResult(sku=sku_label, status="rate_limited",
                          data=_empty_row(original_row, output_fields, "RATE_LIMITED"),
                          sources=[], error_msg=str(e),
-                         primary_value=primary_v, fallback_value=fallback_v)
+                         primary_value=primary_v, fallback_value=fallback_v,
+                         category_value=category_v)
     except Exception as e:
         return SKUResult(sku=sku_label, status="error",
                          data=_empty_row(original_row, output_fields, "ERROR"),
                          sources=[], error_msg=str(e),
-                         primary_value=primary_v, fallback_value=fallback_v)
+                         primary_value=primary_v, fallback_value=fallback_v,
+                         category_value=category_v)
 
     # Pre-compute attribution helpers used by both fallback hooks below.
     # `fallback_distinct` doesn't change once set; `used_primary_query`
@@ -114,7 +118,9 @@ def process_product(
     if (fetch_status in ("blocked", "not_found")
             and used_primary_query
             and fallback_distinct):
-        fallback_only = IdentifierSet(primary=fallback_v, fallback="")
+        # Preserve the category hint into the fallback search — same product,
+        # same industry context.
+        fallback_only = IdentifierSet(primary=fallback_v, fallback="", category=category_v)
         try:
             pages_fb, status_fb, query_fb, errors_fb = fetch_pages_for_product(
                 fallback_only, search_cfg
@@ -162,7 +168,8 @@ def process_product(
         return SKUResult(sku=sku_label, status=fetch_status,
                          data=_empty_row(original_row, output_fields, fetch_status.upper()),
                          sources=[], error_msg=block_msg, query_used=query_used,
-                         primary_value=primary_v, fallback_value=fallback_v)
+                         primary_value=primary_v, fallback_value=fallback_v,
+                         category_value=category_v)
 
     sources = [p["url"] for p in pages]
 
@@ -194,7 +201,8 @@ def process_product(
                          data=_empty_row(original_row, output_fields, "ERROR"),
                          sources=sources, error_msg=str(e),
                          debug_pages=debug_pages, query_used=query_used,
-                         primary_value=primary_v, fallback_value=fallback_v)
+                         primary_value=primary_v, fallback_value=fallback_v,
+                         category_value=category_v)
 
     # 5b. Extraction-triggered fallback. The HTTP-level fallback above only
     # fires when the page fetch fails outright. But Google can return a
@@ -220,7 +228,8 @@ def process_product(
             and "ERROR" not in flag_now
             and current_used_primary
             and fallback_distinct):
-        fallback_only = IdentifierSet(primary=fallback_v, fallback="")
+        # Preserve the category hint into the fallback search.
+        fallback_only = IdentifierSet(primary=fallback_v, fallback="", category=category_v)
         try:
             pages_fb, status_fb, query_fb, errors_fb = fetch_pages_for_product(
                 fallback_only, search_cfg
@@ -303,6 +312,7 @@ def process_product(
         jsonld_hint=jsonld_hint or {},
         query_used=query_used,
         primary_value=primary_v, fallback_value=fallback_v,
+        category_value=category_v,
     )
 
 
@@ -334,7 +344,8 @@ def process_batch(
                     sku=ids.display_label(), status="error",
                     data={"review_flag": "ERROR", "_error": str(e)},
                     sources=[],
-                    primary_value=(ids.primary or "").strip(),
+                    primary_value=(ids.primary  or "").strip(),
                     fallback_value=(ids.fallback or "").strip(),
+                    category_value=(ids.category or "").strip(),
                 ))
     return results

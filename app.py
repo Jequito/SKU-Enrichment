@@ -1,6 +1,6 @@
 """
 app.py — SKU Bulk Product Enrichment
-Streamlit frontend. Searches DuckDuckGo (no API key), fetches via httpx +
+Streamlit frontend. Searches Google via SerpAPI, fetches via httpx +
 trafilatura, extracts via OpenAI / Gemini / Claude.
 
 Pause/Stop work because the pipeline runs ONE BATCH PER SCRIPT RUN — between
@@ -204,6 +204,39 @@ with st.sidebar:
         ),
     )
 
+    # ── Exact-match toggles ──
+    # By default both queries are wrapped in double quotes for verbatim matching.
+    # Turn either off when the corresponding code is formatted differently across
+    # sites (e.g. an SKU you store as "WVE-T60S" but vendors render as "WVE T60 S"
+    # or "WVET60S"). Without quotes Google does its usual loosening — handy for
+    # those cases, but it can also pull in adjacent products. Per-stage toggles
+    # let you pick: e.g. quote the strict manufacturer code in Primary, leave the
+    # internal SKU in Fallback unquoted for tolerance.
+    primary_exact = st.toggle(
+        "Primary: exact match (quoted)",
+        value=True,
+        disabled=is_running,
+        key="primary_exact_toggle",
+        help=(
+            "Wraps the Primary search in double quotes to force Google to match "
+            "the value verbatim. ON by default for unambiguous codes. Turn OFF "
+            "when the code is formatted differently across sites — e.g. you "
+            "store 'WVE-T60S' but pages render it as 'WVE T60 S'."
+        ),
+    )
+
+    fallback_exact = st.toggle(
+        "Fallback: exact match (quoted)",
+        value=True,
+        disabled=is_running,
+        key="fallback_exact_toggle",
+        help=(
+            "Same as the Primary toggle but applied to the Fallback search. "
+            "Turn OFF if your fallback column holds values whose formatting "
+            "varies across vendors."
+        ),
+    )
+
     urls_per_sku = st.slider("URLs per product", 1, 5, 1, disabled=is_running,
                               help="Number of top-scored URLs to fetch and pass to the LLM. With exact-match Google searches the top hit is usually correct — 1 is enough most of the time.")
 
@@ -286,18 +319,24 @@ one up on **Google via SerpAPI**. It fetches the top product pages with
 (OpenAI, Gemini, or Claude) to extract structured fields. Results are
 downloadable as CSV or Excel.
 
-#### Two-column exact-match search
+#### Two-column search with three fallback layers
 
-For each row, the tool runs an exact-quoted Google search on your **Primary**
-column. If that returns zero results, it retries on your **Fallback** column.
-That's it — no wide-net fallback queries that risk pulling in pages about
-different products.
+For each row, the tool runs a Google search on your **Primary** column. By
+default this is wrapped in double quotes for an exact-phrase match — toggle
+that off in the sidebar if your codes are formatted differently across sites.
+The pipeline can fall back to your **Fallback** column three different ways:
 
-| Outcome | SerpAPI queries used |
-|---|---|
-| Primary search finds something | 1 |
-| Primary returns nothing, fallback finds something | 2 |
-| Both return nothing | 1 (only the primary is charged; empty results are free) |
+1. **Search-stage relevance fallback** — primary search returned results, but
+   none of them mention the primary code. Retry on the fallback term.
+2. **Post-fetch HTTP fallback** — primary search succeeded but every URL
+   it returned was 403/timeout/blocklisted. Retry the search on the fallback.
+3. **Extraction-triggered fallback** *(new)* — primary fetched cleanly and
+   the LLM ran successfully, but came back with empty descriptions. Try the
+   fallback as a fresh search and adopt its result if it has descriptions.
+
+Layer 3 catches the common case where Google surfaces a thin page — a PDF
+spec sheet, a replacement-parts listing, a discontinued-product stub —
+that mentions the SKU but contains no descriptive copy.
 
 #### Validation
 
@@ -308,8 +347,10 @@ appears in the page content. If neither does, the row is flagged
 #### JSON-LD hints
 
 When a page contains `<script type="application/ld+json">` Product schema, the
-structured data is passed to the LLM as a trusted starting point. This produces
-significantly more accurate results on retailer and manufacturer sites.
+structured data is passed to the LLM as a trusted starting point AND used as
+a per-field safety net — any field the LLM leaves empty gets backfilled from
+the JSON-LD if available. This produces significantly more accurate results
+on retailer and manufacturer sites.
     """)
 
 st.divider()
@@ -353,7 +394,7 @@ with col_upload:
 
 with col_config:
     st.markdown("### 🏷️ Identifier Columns")
-    st.caption("Map both columns. Primary is searched first, Fallback only runs if the primary search returns nothing.")
+    st.caption("Map both columns. Primary is searched first, Fallback runs if the primary search returns nothing useful — or if extraction comes back description-empty.")
 
     if columns:
         # Auto-detect: manufacturer/product code typically goes in Primary,
@@ -372,7 +413,7 @@ with col_config:
             columns,
             index=_auto_index(columns, primary_hints),
             disabled=is_running,
-            help="Searched first as an exact-quoted Google query. Typically your Product Code / MPN.",
+            help="Searched first. Quoted iff the 'Primary: exact match' toggle is on. Typically your Product Code / MPN.",
         )
 
         fallback_options = [c for c in columns if c != primary_column]
@@ -381,7 +422,7 @@ with col_config:
             fallback_options,
             index=_auto_index(fallback_options, fallback_hints),
             disabled=is_running,
-            help="Searched only if the primary returns zero results. Typically your internal SKU.",
+            help="Used as a fallback when the primary returns nothing relevant, fetches all fail, or extraction comes back empty. Typically your internal SKU.",
         )
     else:
         primary_column  = "— upload a file first —"
@@ -559,6 +600,8 @@ if is_running and st.session_state["work_queue"]:
         country_code      = country_code,
         restrict_language = restrict_language,
         restrict_country  = restrict_country,
+        primary_exact     = primary_exact,
+        fallback_exact    = fallback_exact,
         urls_per_sku      = urls_per_sku,
         max_chars         = max_chars,
         timeout           = timeout,
@@ -822,7 +865,6 @@ if st.session_state["results"]:
 
         # Build a readable plaintext serialisation for download
         from datetime import datetime
-        import json as _json
 
         def _build_debug_txt(log: list, error_log: list) -> str:
             lines = []

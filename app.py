@@ -129,8 +129,31 @@ defaults = {
     "stats":           {"success": 0, "review": 0, "not_found": 0,
                         "error": 0, "rate_limited": 0, "jsonld_hint": 0},
     "rate_limit_hit":  False,
+    # Captured at Start. This is the SearchConfig that the pipeline ACTUALLY
+    # used for the run, surfaced in the debug log so the user can verify
+    # what was applied (independent of any UI/state confusion).
+    "run_settings":    {},
 }
 for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ── Widget state defaults ───────────────────────────────────────────────────
+# Pre-initialise every toggle key in session_state. This is the recommended
+# Streamlit pattern when you also pass `key=` — it avoids a documented quirk
+# where mixing `value=` with `key=` can silently re-apply the default on
+# re-renders triggered by changes to other widget params (e.g. `disabled=`
+# flipping when Start is pressed). After this init block, the widgets below
+# are called with `key=` only — no `value=` — so session_state is the single
+# source of truth.
+_widget_defaults = {
+    "primary_exact_toggle":    True,
+    "fallback_exact_toggle":   True,
+    "restrict_language_toggle": True,
+    "restrict_country_toggle": False,
+    "debug_mode_toggle":       False,
+}
+for k, v in _widget_defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -181,7 +204,6 @@ with st.sidebar:
 
     restrict_language = st.toggle(
         "Restrict to region's language",
-        value=True,
         disabled=is_running,
         key="restrict_language_toggle",
         help=(
@@ -193,7 +215,6 @@ with st.sidebar:
 
     restrict_country = st.toggle(
         "Restrict to region only (strict)",
-        value=False,
         disabled=is_running,
         key="restrict_country_toggle",
         help=(
@@ -253,7 +274,7 @@ with st.sidebar:
 
     st.divider()
     debug_mode = st.toggle(
-        "🔬 Debug mode", value=False, disabled=is_running,
+        "🔬 Debug mode", disabled=is_running,
         key="debug_mode_toggle",
         help=(
             "Stores the cleaned text sent to the LLM for each product. "
@@ -396,7 +417,6 @@ with col_config:
         # cases, but it can also pull in adjacent products.
         primary_exact = st.toggle(
             "Exact match (quoted)",
-            value=True,
             disabled=is_running,
             key="primary_exact_toggle",
             help=(
@@ -417,7 +437,6 @@ with col_config:
         )
         fallback_exact = st.toggle(
             "Exact match (quoted)",
-            value=True,
             disabled=is_running,
             key="fallback_exact_toggle",
             help=(
@@ -426,11 +445,38 @@ with col_config:
                 "varies across vendors."
             ),
         )
+
+        # Optional category column. Independently useful even with strict
+        # search working perfectly: codes like "1204086639" or "105666" can
+        # legitimately match different products in different industries
+        # (105666 hits Thermo Fisher reagents AND Danfoss switch parts).
+        # When set, the category value is appended to the search query as a
+        # loose refinement (never quoted, so Google can match category-related
+        # terms broadly) and is also passed to the LLM prompt so it can
+        # reject pages that describe the wrong industry.
+        category_options = ["(none)"] + [c for c in columns
+                                         if c not in (primary_column, fallback_column)]
+        category_column = st.selectbox(
+            "Category hint column (optional)",
+            category_options,
+            index=0,
+            disabled=is_running,
+            help=(
+                "Optional. When set, the row's category value is appended to "
+                "Google searches as a refinement (e.g. `\"1204086639\" sheet "
+                "music`) AND included in the LLM prompt as context. Helps "
+                "disambiguate ambiguous numeric codes that match products in "
+                "unrelated industries. Leave as '(none)' if your codes are "
+                "already unique enough."
+            ),
+        )
     else:
         primary_column  = "— upload a file first —"
         fallback_column = "— upload a file first —"
+        category_column = "(none)"
         st.selectbox("Primary search column (required)",  ["— upload a file first —"], disabled=True)
         st.selectbox("Fallback search column (required)", ["— upload a file first —"], disabled=True)
+        st.selectbox("Category hint column (optional)",   ["— upload a file first —"], disabled=True)
 
     # The download/export logic uses sku_column as the row label — point it at
     # the primary column so the existing export plumbing keeps working unchanged.
@@ -531,17 +577,40 @@ if clear_btn:
 # ── Start button: build queue and launch ──────────────────────────────────────
 
 if start_btn and not is_paused:
+    # Resolve the optional category column once. "(none)" means no category.
+    _cat_col = category_column if category_column and category_column != "(none)" else ""
+
     # Fresh start — reset everything
     work_items = []
     for row in rows:
         ids = IdentifierSet(
             primary  = str(row.get(primary_column, "")  or "").strip(),
             fallback = str(row.get(fallback_column, "") or "").strip(),
+            category = str(row.get(_cat_col, "") or "").strip() if _cat_col else "",
         )
         if not ids.is_empty():
             work_items.append((ids, row))
 
     fieldnames = build_fieldnames(columns, selected_fields)
+
+    # Snapshot the SearchConfig values that will be applied for this run.
+    # Saved to session_state so the debug log can show them definitively
+    # — independent of whether the toggles get changed afterwards.
+    run_settings_snapshot = {
+        "primary_exact":     primary_exact,
+        "fallback_exact":    fallback_exact,
+        "country_code":      country_code,
+        "restrict_language": restrict_language,
+        "restrict_country":  restrict_country,
+        "urls_per_sku":      urls_per_sku,
+        "max_chars":         max_chars,
+        "primary_column":    primary_column,
+        "fallback_column":   fallback_column,
+        "category_column":   _cat_col or "(none)",
+        "blocked_domains":   [d for d in (blocked_domains_text or "").splitlines() if d.strip()],
+        "provider":          provider_key,
+        "model":             llm_model,
+    }
 
     st.session_state.update({
         "running":           True,
@@ -559,6 +628,7 @@ if start_btn and not is_paused:
         "selected_fields":   selected_fields,
         "run_export_fields": fieldnames,
         "sku_column":        primary_column,
+        "run_settings":      run_settings_snapshot,
     })
     st.rerun()
 
@@ -684,6 +754,7 @@ if is_running and st.session_state["work_queue"]:
                 "sku":            result.sku,
                 "primary_value":  result.primary_value,
                 "fallback_value": result.fallback_value,
+                "category_value": result.category_value,
                 "status":         result.status,
                 "pages":          result.debug_pages,
                 "jsonld_hit":     result.had_jsonld,
@@ -827,17 +898,23 @@ if st.session_state["results"]:
 
     all_rows = st.session_state["results"]
 
-    _locked_fields  = st.session_state.get("run_export_fields") or fieldnames
-    _locked_sku_col = st.session_state.get("sku_column", "")
+    _locked_fields    = st.session_state.get("run_export_fields") or fieldnames
+    _locked_sku_col   = st.session_state.get("sku_column", "")
+    # The actual enrichment fields the user checked at run time. Distinct
+    # from _locked_fields, which is `original_columns + enrichment_fields`
+    # (used for "Combined" export). Without this, "Enriched only" was
+    # iterating over the merged list and exporting every original column too.
+    _enrichment_only  = st.session_state.get("selected_fields", []) or []
 
     if export_mode.startswith("Enriched"):
+        # SKU column + only the enrichment fields. No original columns.
         _enriched_cols = []
         _seen = set()
-        for _c in ([_locked_sku_col] if _locked_sku_col else []) + list(_locked_fields):
+        for _c in ([_locked_sku_col] if _locked_sku_col else []) + list(_enrichment_only):
             if _c and _c not in _seen:
                 _enriched_cols.append(_c)
                 _seen.add(_c)
-        export_fieldnames = _enriched_cols or _locked_fields
+        export_fieldnames = _enriched_cols or list(_enrichment_only)
         export_label      = "enriched"
     else:
         export_fieldnames = _locked_fields
@@ -868,7 +945,7 @@ if st.session_state["results"]:
         # Build a readable plaintext serialisation for download
         from datetime import datetime
 
-        def _build_debug_txt(log: list, error_log: list) -> str:
+        def _build_debug_txt(log: list, error_log: list, run_settings: dict) -> str:
             lines = []
             lines.append("=" * 70)
             lines.append("SKU ENRICHMENT — DEBUG LOG")
@@ -878,17 +955,47 @@ if st.session_state["results"]:
             lines.append("=" * 70)
             lines.append("")
 
+            # Run configuration as actually applied to the pipeline. Captured
+            # at Start; surfaces what each toggle / dropdown was set to so the
+            # user can verify the run honoured their settings.
+            if run_settings:
+                lines.append("RUN SETTINGS (as applied to the pipeline)")
+                lines.append("-" * 70)
+                lines.append(f"  Provider / model:      {run_settings.get('provider', '?')} / {run_settings.get('model', '?')}")
+                lines.append(f"  Region (gl):           {run_settings.get('country_code', '?')}")
+                lines.append(f"  Restrict language:     {'yes' if run_settings.get('restrict_language') else 'no'}")
+                lines.append(f"  Restrict country:      {'yes' if run_settings.get('restrict_country') else 'no'}")
+                lines.append(f"  Primary column:        {run_settings.get('primary_column', '?')}")
+                lines.append(f"  Primary EXACT match:   {'yes (quoted)' if run_settings.get('primary_exact') else 'NO (loose)'}")
+                lines.append(f"  Fallback column:       {run_settings.get('fallback_column', '?')}")
+                lines.append(f"  Fallback EXACT match:  {'yes (quoted)' if run_settings.get('fallback_exact') else 'NO (loose)'}")
+                lines.append(f"  Category column:       {run_settings.get('category_column', '(none)')}")
+                lines.append(f"  URLs per product:      {run_settings.get('urls_per_sku', '?')}")
+                lines.append(f"  Max chars per page:    {run_settings.get('max_chars', '?')}")
+                blocked = run_settings.get("blocked_domains") or []
+                lines.append(f"  Blocked domains:       {', '.join(blocked) if blocked else '(none)'}")
+                lines.append("")
+
             # Per-row debug entries
             for i, entry in enumerate(log, 1):
                 lines.append("-" * 70)
                 lines.append(f"[{i}/{len(log)}] {entry.get('sku', '?')}")
                 lines.append(f"   primary value:   {entry.get('primary_value') or '(empty)'}")
                 lines.append(f"   fallback value:  {entry.get('fallback_value') or '(empty)'}")
+                if entry.get("category_value"):
+                    lines.append(f"   category value:  {entry.get('category_value')}")
                 lines.append(f"   query used:      {entry.get('query_used') or '(none)'}")
-                # Indicate which column actually triggered the winning query
+                # Indicate which column actually triggered the winning query.
+                # Strip surrounding quotes AND any appended category words so
+                # the comparison works regardless of exact-match/category state.
                 pv = (entry.get('primary_value') or '').strip().lower()
                 fv = (entry.get('fallback_value') or '').strip().lower()
-                qu = (entry.get('query_used') or '').strip().strip('"').lower()
+                cat = (entry.get('category_value') or '').strip().lower()
+                qu_raw = (entry.get('query_used') or '').strip()
+                qu = qu_raw.strip('"').lower()
+                # Remove the category suffix (if any) for the comparison
+                if cat and qu.endswith(" " + cat):
+                    qu = qu[:-(len(cat) + 1)].rstrip().strip('"')
                 if qu and qu == pv:
                     src = "primary"
                 elif qu and qu == fv:
@@ -932,7 +1039,11 @@ if st.session_state["results"]:
 
             return "\n".join(lines)
 
-        debug_txt = _build_debug_txt(debug_log, st.session_state.get("error_log", []))
+        debug_txt = _build_debug_txt(
+            debug_log,
+            st.session_state.get("error_log", []),
+            st.session_state.get("run_settings", {}),
+        )
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
 
         col_caption, col_download = st.columns([3, 1])
@@ -970,21 +1081,32 @@ if st.session_state["results"]:
                 if entry.get("error_msg"):
                     st.error(f"**LLM error:** {entry['error_msg']}")
 
-                # Show both column values + which one the winning query came from
-                pv = (entry.get("primary_value") or "").strip()
-                fv = (entry.get("fallback_value") or "").strip()
-                qu = (query or "").strip().strip('"')
-                if qu and qu.lower() == pv.lower():
+                # Show all column values + which one the winning query came from
+                pv  = (entry.get("primary_value")  or "").strip()
+                fv  = (entry.get("fallback_value") or "").strip()
+                cat = (entry.get("category_value") or "").strip()
+                qu_raw = (query or "").strip()
+                qu = qu_raw.strip('"').lower()
+                # Strip the appended category (if any) from the query for the
+                # source-attribution comparison.
+                if cat and qu.endswith(" " + cat.lower()):
+                    qu = qu[:-(len(cat) + 1)].rstrip().strip('"')
+                if qu and qu == pv.lower():
                     fired = "**primary** column"
-                elif qu and qu.lower() == fv.lower():
+                elif qu and qu == fv.lower():
                     fired = "**fallback** column (primary returned no relevant matches)"
                 else:
                     fired = "—"
-                st.markdown(
+
+                value_line = (
                     f"**Primary value:** `{pv or '(empty)'}` &nbsp;·&nbsp; "
-                    f"**Fallback value:** `{fv or '(empty)'}` &nbsp;·&nbsp; "
-                    f"**Query fired from:** {fired}"
+                    f"**Fallback value:** `{fv or '(empty)'}`"
                 )
+                if cat:
+                    value_line += f" &nbsp;·&nbsp; **Category hint:** `{cat}`"
+                value_line += f" &nbsp;·&nbsp; **Query fired from:** {fired}"
+                st.markdown(value_line)
+
                 if query:
                     st.markdown(f"**Search query used:** `{query}`")
                 if hint:

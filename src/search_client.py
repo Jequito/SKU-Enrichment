@@ -81,9 +81,22 @@ class IdentifierSet:
     """
     primary:  str = ""
     fallback: str = ""
+    # Optional per-row category hint. When non-empty it's appended to the
+    # search query as a loose refinement (never quoted, even when
+    # primary_exact / fallback_exact are on) — e.g. `"1204086639" sheet music`.
+    # Also passed to the LLM prompt as context so it can reject pages that
+    # describe a product in a totally different industry. Useful for
+    # ambiguous numeric SKUs that get reused across industries (the user's
+    # debug log shows `105666` matching Thermo Fisher reagents AND Danfoss
+    # switch parts — neither was the intended music product).
+    category: str = ""
 
     def codes(self) -> list[str]:
-        """All non-empty identifier values, deduped."""
+        """All non-empty identifier values, deduped.
+
+        Category is deliberately excluded — it's a search refinement, not an
+        identifier, so we don't want it counted toward content validation.
+        """
         out = []
         for v in (self.primary, self.fallback):
             v = (v or "").strip()
@@ -241,12 +254,24 @@ def _has_relevant_match(results: list[dict], identifier: str) -> bool:
     return False
 
 
-def _format_query(value: str, exact: bool) -> str:
-    """Quote the value when exact-match is requested; otherwise pass through."""
+def _format_query(value: str, exact: bool, category: str = "") -> str:
+    """Build a Google query for one identifier value.
+
+    Quoting: applied to `value` only when exact=True. The category, if
+    provided, is always appended *unquoted* — Google should match category
+    terms loosely so they refine without over-constraining the result set.
+    Examples:
+        ('ABC123',     True,  '')           -> '"ABC123"'
+        ('ABC123',     False, '')           -> 'ABC123'
+        ('1204086639', True,  'sheet music')-> '"1204086639" sheet music'
+        ('WVE-T60S',   False, 'cooktop')    -> 'WVE-T60S cooktop'
+    """
     v = (value or "").strip()
     if not v:
         return ""
-    return f'"{v}"' if exact else v
+    base = f'"{v}"' if exact else v
+    cat  = (category or "").strip()
+    return f"{base} {cat}" if cat else base
 
 
 def search_for_product(ids: IdentifierSet, cfg: SearchConfig) -> tuple[list[dict], str]:
@@ -268,22 +293,23 @@ def search_for_product(ids: IdentifierSet, cfg: SearchConfig) -> tuple[list[dict
     the primary returned *something*, those weak results are returned anyway
     so the row gets at least one fetch attempt.
     """
-    primary_val  = (ids.primary or "").strip()
+    primary_val  = (ids.primary  or "").strip()
     fallback_val = (ids.fallback or "").strip()
+    category_val = (ids.category or "").strip()
 
     primary_results: list[dict] = []
     primary_query   = ""
 
     # Stage 1: primary
     if primary_val:
-        primary_query   = _format_query(primary_val, cfg.primary_exact)
+        primary_query   = _format_query(primary_val, cfg.primary_exact, category_val)
         primary_results = search(primary_query, cfg)
         if primary_results and _has_relevant_match(primary_results, primary_val):
             return primary_results, primary_query
 
     # Stage 2: fallback — runs on either zero results or weak/irrelevant results
     if fallback_val and fallback_val.lower() != primary_val.lower():
-        fallback_query   = _format_query(fallback_val, cfg.fallback_exact)
+        fallback_query   = _format_query(fallback_val, cfg.fallback_exact, category_val)
         fallback_results = search(fallback_query, cfg)
         if fallback_results:
             return fallback_results, fallback_query
@@ -513,6 +539,65 @@ def fetch_pages_for_product(
                 "error": fetched.get("error", "Unknown"),
             })
         time.sleep(cfg.delay_between)
+
+    # ── URL-level rescue ─────────────────────────────────────────────────
+    # If we got pages but NONE of them validate (i.e. none of them mention
+    # the user's identifier in their content after normalisation), the top
+    # of Google's results was probably SEO spam. Scan further down the
+    # candidate list — up to 3 more fetches — to find a validating page.
+    # Caps the cost at urls_per_sku + 3 fetches per row in the worst case.
+    #
+    # Triggered specifically by the case in the user's debug log: with
+    # urls_per_sku=1 and a SEO-spam top result (`crue.idsn.gov.co`), the
+    # pipeline previously gave up after one fetch. Now it falls through to
+    # the next candidate (e.g. bettermusic.com.au, megamusic.com.au).
+    if pages and not any(content_validates_product(p["content"], ids) for p in pages):
+        all_candidates = select_top_urls(results, len(results), extra_blocked)
+        already_tried = {p["url"] for p in pages} | {
+            fe["url"] for fe in fetch_errors if fe.get("url")
+        }
+        rescue_attempts   = 0
+        max_rescue_fetch  = 3
+
+        for candidate in all_candidates:
+            if rescue_attempts >= max_rescue_fetch:
+                break
+            url = candidate["url"]
+            if url in already_tried:
+                continue
+            rescue_attempts += 1
+
+            try:
+                fetched = fetch_page(url, cfg)
+            except Exception as e:
+                fetched = {"ok": False, "error": f"Unexpected: {type(e).__name__}"}
+
+            if fetched.get("ok"):
+                rescued = {
+                    "url":         url,
+                    "content":     fetched["content"],
+                    "jsonld_hint": fetched.get("jsonld"),
+                }
+                if content_validates_product(rescued["content"], ids):
+                    # Success — promote the rescued page to the front of the
+                    # list so the LLM treats it as Source 1. The original
+                    # non-validating pages stay as secondary context, which
+                    # rarely hurts and occasionally helps when they share
+                    # generic spec info.
+                    pages = [rescued] + pages
+                    break
+                # Fetched OK but still doesn't validate — record and keep
+                # looking (don't add to pages: more noise won't help).
+                fetch_errors.append({
+                    "url":   url,
+                    "error": "Rescue: page fetched but identifier not in content",
+                })
+            else:
+                fetch_errors.append({
+                    "url":   url,
+                    "error": f"Rescue fetch: {fetched.get('error', 'Unknown')}",
+                })
+            time.sleep(cfg.delay_between)
 
     if not pages:
         return [], "blocked", query, fetch_errors

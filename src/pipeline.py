@@ -118,9 +118,12 @@ def process_product(
     if (fetch_status in ("blocked", "not_found")
             and used_primary_query
             and fallback_distinct):
-        # Preserve the category hint into the fallback search — same product,
-        # same industry context.
-        fallback_only = IdentifierSet(primary=fallback_v, fallback="", category=category_v)
+        # Construct as fallback-in-the-fallback-slot so search_for_product's
+        # existing logic naturally applies cfg.fallback_exact (not
+        # cfg.primary_exact). Earlier this was put in the primary slot,
+        # which silently flipped the exact-match setting — quoting fallback
+        # terms even when the user had Fallback exact match OFF.
+        fallback_only = IdentifierSet(primary="", fallback=fallback_v, category=category_v)
         try:
             pages_fb, status_fb, query_fb, errors_fb = fetch_pages_for_product(
                 fallback_only, search_cfg
@@ -228,8 +231,12 @@ def process_product(
             and "ERROR" not in flag_now
             and current_used_primary
             and fallback_distinct):
-        # Preserve the category hint into the fallback search.
-        fallback_only = IdentifierSet(primary=fallback_v, fallback="", category=category_v)
+        # Same slot fix as the post-fetch fallback: put fallback_v in the
+        # FALLBACK slot so search_for_product applies cfg.fallback_exact
+        # rather than cfg.primary_exact. Without this the user's "Fallback
+        # exact match: OFF" setting was being silently ignored every time
+        # this fallback level fired.
+        fallback_only = IdentifierSet(primary="", fallback=fallback_v, category=category_v)
         try:
             pages_fb, status_fb, query_fb, errors_fb = fetch_pages_for_product(
                 fallback_only, search_cfg

@@ -8,6 +8,7 @@ optional jsonld_hint dict for trusted structured-data context.
 """
 
 import json
+import re
 import threading
 from dataclasses import dataclass
 
@@ -135,19 +136,37 @@ SOURCES:
 JSON output for "{primary_label}":"""
 
 
+# Anchored at the start/end of the trimmed string. This deliberately does NOT
+# match triple-backticks anywhere in the middle of the response — so a
+# long_description that legitimately contains a ```code block``` won't have
+# its inner backticks shredded into the JSON parser's lap. The previous
+# implementation used `text.replace("```", "")` which corrupted any extracted
+# field containing triple backticks.
+_FENCE_OPEN  = re.compile(r"^\s*```(?:json|JSON)?\s*", re.IGNORECASE)
+_FENCE_CLOSE = re.compile(r"\s*```\s*$")
+
+
 def parse_json_response(text: str) -> dict:
     """
     Extract the first valid JSON object from LLM output.
-    Uses raw_decode so trailing/extra content after the object doesn't break
-    parsing on chatty models.
+
+    Strips markdown code fences ONLY at the very start/end of the string
+    (anchored regex) so triple-backticks appearing inside extracted field
+    values are preserved. Then uses raw_decode so trailing/extra content
+    after the object doesn't break parsing on chatty models.
     """
     if not text:
         return {}
-    text = text.replace("```json", "").replace("```", "").strip()
+
+    text = text.strip()
+    text = _FENCE_OPEN.sub("", text)
+    text = _FENCE_CLOSE.sub("", text)
+
     try:
         start = text.index("{")
     except ValueError:
         return {}
+
     decoder = json.JSONDecoder()
     try:
         obj, _ = decoder.raw_decode(text, start)
@@ -280,25 +299,36 @@ def extract(
         if f not in result:
             result[f] = ""
 
+    # ── JSON-LD backfill ──────────────────────────────────────────────────
+    # Always backfill empty fields from the JSON-LD hint when one is
+    # available — not just when the LLM returned nothing at all. This is
+    # the fix for the "has_any trap": previously the backfill was gated
+    # on every important field being empty, so as soon as the LLM
+    # extracted ANY field (commonly product_name from the page title), the
+    # entire JSON-LD payload — including perfect descriptions, brand,
+    # specs and barcode pulled straight from structured data — was thrown
+    # away. Now we treat JSON-LD as a per-field safety net: for each empty
+    # output field, fill it in from the hint if the hint has it.
+    if jsonld_hint and pages:
+        for f, v in jsonld_hint.items():
+            if f in all_fields and not str(result.get(f, "") or "").strip():
+                if v:  # don't overwrite empty with empty
+                    result[f] = v
+
     # Safety net: if the LLM bailed and returned everything empty despite us
-    # providing source pages, populate the bare minimum so the row isn't
-    # useless to the user. This handles cases where some LLMs refuse to
-    # extract data when they suspect a product mismatch — even with explicit
-    # prompt instructions, Gemini in particular is prone to this.
+    # providing source pages — and the JSON-LD backfill above didn't rescue
+    # us either — populate the bare minimum so the row isn't useless to the
+    # user. This handles cases where some LLMs refuse to extract data when
+    # they suspect a product mismatch — even with explicit prompt
+    # instructions, Gemini in particular is prone to this.
     important = ("product_name", "brand", "short_description", "long_description",
                  "specifications", "category", "model_number")
     has_any = any(str(result.get(f, "") or "").strip() for f in important)
 
     if not has_any and pages:
-        # First fallback: borrow from JSON-LD hint if it exists
-        if jsonld_hint:
-            for f, v in jsonld_hint.items():
-                if f in all_fields and not result.get(f):
-                    result[f] = v
-            has_any = any(str(result.get(f, "") or "").strip() for f in important)
-
-        # Always populate source_url and flag for review — even if everything
-        # else is still empty, the user gets a URL to manually check
+        # Always populate source_url and flag for review — even if
+        # everything else is still empty, the user gets a URL to manually
+        # check.
         if not result.get("source_url"):
             result["source_url"] = pages[0]["url"]
 

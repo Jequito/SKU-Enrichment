@@ -1,13 +1,14 @@
 """
 src/pipeline.py
-Per-product processing with IdentifierSet cascade search.
+Per-product processing with cascade search.
 
 Each work item is (IdentifierSet, original_row). The pipeline:
-  1. Cascade search via DuckDuckGo
-  2. Fetch top URLs via httpx + trafilatura
-  3. Extract JSON-LD from raw HTML as a trusted hint
-  4. Validate fetched content references at least one identifier code
-  5. LLM extraction (always runs, takes JSON-LD hint as foundation)
+  1. Search → fetch (primary, then fallback if primary fails at HTTP level)
+  2. JSON-LD extraction from raw HTML as a trusted hint
+  3. Identifier validation against fetched content
+  4. LLM extraction (always runs, takes JSON-LD hint as foundation)
+  5. NEW: extraction-triggered fallback — if LLM returned empty descriptions,
+     try the fallback column as a fresh search before returning the row.
 """
 
 from dataclasses import dataclass, field
@@ -44,6 +45,24 @@ def _empty_row(original_row: dict, output_fields: list, flag: str) -> dict:
     return row
 
 
+def _has_descriptions(extracted: dict) -> bool:
+    """True iff the LLM result contains a non-empty short or long description."""
+    return (
+        bool(str(extracted.get("short_description", "") or "").strip()) or
+        bool(str(extracted.get("long_description",  "") or "").strip())
+    )
+
+
+def _build_debug_pages(pages: list, ids: IdentifierSet) -> list:
+    """Materialise debug entries for the active set of pages."""
+    return [{
+        "url":           p["url"],
+        "cleaned_chars": len(p["content"]),
+        "cleaned_text":  p["content"],
+        "validates":     content_validates_product(p["content"], ids),
+    } for p in pages]
+
+
 def process_product(
     ids:           IdentifierSet,
     original_row:  dict,
@@ -72,20 +91,26 @@ def process_product(
                          sources=[], error_msg=str(e),
                          primary_value=primary_v, fallback_value=fallback_v)
 
+    # Pre-compute attribution helpers used by both fallback hooks below.
+    # `fallback_distinct` doesn't change once set; `used_primary_query`
+    # reflects the FIRST successful query and gets stale if the post-fetch
+    # fallback later promotes a different query — we recompute it
+    # against the current `query_used` whenever we need a fresh read.
+    fallback_distinct = (
+        bool(fallback_v) and
+        fallback_v.lower() != primary_v.lower()
+    )
+    used_primary_query = (
+        bool(primary_v) and
+        query_used.strip().strip('"').lower() == primary_v.lower()
+    )
+
     # 1b. Post-fetch fallback retry. Triggers when the first attempt came back
     # blocked/not-found AND the winning query was the primary (which means the
     # search-stage relevance trigger didn't already fire the fallback). Catches
     # cases like: Google found a relevant URL, but it was on your blocklist /
     # returned 403 / was a JS-only page. Without this, those rows would just
     # die as BLOCKED even when the user has a perfectly good fallback column.
-    used_primary_query = (
-        bool(primary_v) and
-        query_used.strip().strip('"').lower() == primary_v.lower()
-    )
-    fallback_distinct = (
-        bool(fallback_v) and
-        fallback_v.lower() != primary_v.lower()
-    )
     if (fetch_status in ("blocked", "not_found")
             and used_primary_query
             and fallback_distinct):
@@ -157,17 +182,9 @@ def process_product(
     )
 
     # 4. Capture debug info if requested
-    debug_pages = []
-    if debug:
-        for page in pages:
-            debug_pages.append({
-                "url":           page["url"],
-                "cleaned_chars": len(page["content"]),
-                "cleaned_text":  page["content"],
-                "validates":     content_validates_product(page["content"], ids),
-            })
+    debug_pages = _build_debug_pages(pages, ids) if debug else []
 
-    # 5. LLM extraction
+    # 5. LLM extraction (primary attempt)
     try:
         extracted = extract(ids, pages, output_fields, llm_cfg,
                             jsonld_hint=jsonld_hint,
@@ -179,8 +196,82 @@ def process_product(
                          debug_pages=debug_pages, query_used=query_used,
                          primary_value=primary_v, fallback_value=fallback_v)
 
-    # If validation failed, override the flag to REVIEW_NEEDED — content may
-    # be about a different product even if extraction looked clean.
+    # 5b. Extraction-triggered fallback. The HTTP-level fallback above only
+    # fires when the page fetch fails outright. But Google can return a
+    # HTTP-200 page that's content-thin (replacement-parts listing, sparse
+    # PDF spec sheet, manufacturer's discontinued-product stub) — those
+    # finish "successful" with empty short/long descriptions and the user
+    # never gets the rich page that the fallback column might have led to.
+    #
+    # Trigger conditions:
+    #   - LLM result has no descriptions, AND
+    #   - the winning query came from the primary (re-read fresh in case
+    #     the post-fetch fallback already promoted query_used), AND
+    #   - a distinct fallback value exists, AND
+    #   - the LLM didn't error out (otherwise the row is already broken
+    #     and a second extraction won't help diagnose what went wrong).
+    flag_now = str(extracted.get("review_flag", "") or "").upper()
+    current_used_primary = (
+        bool(primary_v) and
+        query_used.strip().strip('"').lower() == primary_v.lower()
+    )
+
+    if (not _has_descriptions(extracted)
+            and "ERROR" not in flag_now
+            and current_used_primary
+            and fallback_distinct):
+        fallback_only = IdentifierSet(primary=fallback_v, fallback="")
+        try:
+            pages_fb, status_fb, query_fb, errors_fb = fetch_pages_for_product(
+                fallback_only, search_cfg
+            )
+        except RateLimitError:
+            pages_fb, status_fb, query_fb, errors_fb = [], "rate_limited", "", []
+        except BackendConfigError:
+            raise
+        except Exception:
+            pages_fb, status_fb, query_fb, errors_fb = [], "error", "", []
+
+        if status_fb == "ok" and pages_fb:
+            # Pull a fresh JSON-LD hint from the fallback pages — we want
+            # the LLM to have the strongest possible structured-data
+            # foundation for this second attempt.
+            jsonld_hint_fb = None
+            for page in pages_fb:
+                candidate = page.get("jsonld_hint")
+                if candidate and candidate.get("product_name"):
+                    jsonld_hint_fb = candidate
+                    break
+
+            try:
+                extracted_fb = extract(fallback_only, pages_fb, output_fields, llm_cfg,
+                                       jsonld_hint=jsonld_hint_fb,
+                                       max_chars=search_cfg.max_chars)
+            except Exception:
+                extracted_fb = {}
+
+            # Only adopt the fallback result when it actually rescues the
+            # missing descriptions. If it ALSO came back description-less,
+            # the original primary result (which at least has product_name,
+            # specs, etc.) is still the better answer.
+            if _has_descriptions(extracted_fb):
+                extracted     = extracted_fb
+                pages         = pages_fb
+                sources       = [p["url"] for p in pages]
+                query_used    = query_fb
+                jsonld_hint   = jsonld_hint_fb
+                # Re-validate against the ORIGINAL identifier set — we still
+                # want the validation flag to reflect whether the new pages
+                # mention the user's actual codes, not the standalone
+                # fallback term we used for searching.
+                any_validates = any(
+                    content_validates_product(p["content"], ids) for p in pages
+                )
+                if debug:
+                    debug_pages = _build_debug_pages(pages, ids)
+
+    # 6. If validation failed, override the flag to REVIEW_NEEDED — content
+    # may be about a different product even if extraction looked clean.
     if not any_validates:
         existing = str(extracted.get("review_flag", "") or "").upper()
         if "ERROR" not in existing:

@@ -41,10 +41,18 @@ SYSTEM_PROMPT = (
 
 
 def _identifier_block(ids) -> str:
-    """Render IdentifierSet as a labelled block for the prompt."""
+    """Render IdentifierSet as a labelled block for the prompt.
+
+    Category, when present, is included so the LLM can cross-check the page's
+    apparent industry against the user's intent and flag review when they
+    mismatch (e.g. an SKU like '105666' that hits both Thermo Fisher reagents
+    and Danfoss switch parts — only one of those is the user's product).
+    """
     parts = []
     if ids.primary:  parts.append(f"  Primary identifier:   {ids.primary}")
     if ids.fallback: parts.append(f"  Fallback identifier:  {ids.fallback}")
+    if getattr(ids, "category", "") and ids.category.strip():
+        parts.append(f"  Category hint:        {ids.category}")
     return "\n".join(parts) if parts else "  (none provided)"
 
 
@@ -115,6 +123,12 @@ RULES:
   determine confidence. A clean match → review_flag=VERIFIED.
   A partial/uncertain match → review_flag=REVIEW_NEEDED with extracted data.
   No match at all → still extract what's there, review_flag=REVIEW_NEEDED.
+- If a Category hint is provided above, cross-check it against the page.
+  When the page is clearly about a product in a different industry from the
+  category hint (e.g. category says "Sheet Music" but the page describes a
+  laboratory reagent), set review_flag=REVIEW_NEEDED and still extract
+  whatever data the page provides — the user will manually verify whether
+  it's actually the right product or a different one with the same code.
 - Only extract values explicitly present in the sources or trusted metadata —
   never invent data. But page metadata (title, meta description) IS valid
   source data; use it.

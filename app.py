@@ -226,7 +226,7 @@ with st.sidebar:
     )
 
     urls_per_sku = st.slider("URLs per product", 1, 5, 1, disabled=is_running,
-                              help="Number of top-scored URLs to fetch and pass to the LLM. With exact-match Google searches the top hit is usually correct — 1 is enough most of the time.")
+                              help="Number of URLs to fetch from the SERP, taken top-to-bottom in Google's order. Blocked domains and PDFs are skipped. With exact-match searches the top hit is usually correct — 1 is enough most of the time.")
 
     blocked_domains_text = st.text_area(
         "Blocked domains (one per line)",
@@ -237,9 +237,11 @@ with st.sidebar:
         help=(
             "Domains to exclude from search results — useful for skipping your own "
             "sites so you don't enrich a SKU using data from the very page you're "
-            "trying to populate. Substring match: 'yourcompany.com' also blocks "
-            "shop.yourcompany.com. Social, marketplace and aggregator sites are "
-            "already excluded by default."
+            "trying to populate. Exact-or-subdomain match: 'yourcompany.com' blocks "
+            "yourcompany.com itself and any subdomain like shop.yourcompany.com, "
+            "but does NOT block unrelated domains that just happen to contain the "
+            "same letters. Social, marketplace and aggregator sites are already "
+            "excluded by default."
         ),
     )
 
@@ -307,30 +309,46 @@ one up on **Google via SerpAPI**. It fetches the top product pages with
 (OpenAI, Gemini, or Claude) to extract structured fields. Results are
 downloadable as CSV or Excel.
 
-#### Two-column search with three fallback layers
+#### Optional fallback column
 
-For each row, the tool runs a Google search on your **Primary** column. By
-default this is wrapped in double quotes for an exact-phrase match — toggle
-that off in the sidebar if your codes are formatted differently across sites.
-The pipeline can fall back to your **Fallback** column three different ways:
+For each row, the tool runs a Google search on your **Primary** column.
+By default it's wrapped in double quotes for an exact-phrase match —
+toggle that off in the sidebar if your values are formatted differently
+across sites or if you're searching by product name where loose matching
+helps.
 
-1. **Search-stage relevance fallback** — primary search returned results, but
-   none of them mention the primary code. Retry on the fallback term.
-2. **Post-fetch HTTP fallback** — primary search succeeded but every URL
-   it returned was 403/timeout/blocklisted. Retry the search on the fallback.
-3. **Extraction-triggered fallback** *(new)* — primary fetched cleanly and
-   the LLM ran successfully, but came back with empty descriptions. Try the
-   fallback as a fresh search and adopt its result if it has descriptions.
+Mapping a **Fallback** column is optional. When you do, it kicks in only
+if the primary search produced no extracted descriptions: the LLM ran
+fine, but the page Google surfaced didn't have descriptive copy. The
+tool then re-runs the search using the fallback term and adopts that
+result if it actually has descriptions. This catches thin pages — PDF
+spec sheets, replacement-parts listings, discontinued-product stubs.
 
-Layer 3 catches the common case where Google surfaces a thin page — a PDF
-spec sheet, a replacement-parts listing, a discontinued-product stub —
-that mentions the SKU but contains no descriptive copy.
+Each column has its own exact-match toggle, so you can quote a SKU
+strictly while leaving a product-name primary loose, or vice versa.
 
-#### Validation
+#### URL selection
 
-When pages are fetched, the tool checks that the Primary or Fallback value
-appears in the page content. If neither does, the row is flagged
-`REVIEW_NEEDED` because Google may have surfaced a different product.
+The top **N** SERP results in Google's order are fetched, where N is the
+"URLs per SKU" setting in the sidebar. Blocked domains and PDFs are
+skipped (PDFs can't be cleaned by `trafilatura`). There's no scoring or
+re-ranking — Google's order is preserved. To change which URLs get
+picked, add to the blocked-domains list or raise N.
+
+#### Confidence flags
+
+After extraction, rows are flagged based on what the LLM and the page
+content tell us:
+
+- `VERIFIED` — clean match with strong content.
+- `REVIEW_NEEDED` — the LLM itself flagged the row (conflicting values
+  across sources, partial match, etc.).
+- `LOW_CONFIDENCE` — extraction succeeded but no fetched page appears
+  to be about the searched product based on token overlap. Useful for
+  catching wrong-product matches on ambiguous identifiers (numeric SKUs
+  that collide across industries, SEO spam pages that surface for a
+  model number but actually sell something else).
+- `ERROR` — extraction failed.
 
 #### JSON-LD hints
 
@@ -382,7 +400,7 @@ with col_upload:
 
 with col_config:
     st.markdown("### 🏷️ Identifier Columns")
-    st.caption("Map both columns. Primary is searched first, Fallback runs if the primary search returns nothing useful — or if extraction comes back description-empty.")
+    st.caption("Pick the column to search on. Fallback is optional — when set, it's used only if the primary search produces no extracted descriptions.")
 
     # Defaults so SearchConfig has values even before the file is uploaded.
     # Streamlit's `key=` makes the toggles below remember the user's choice
@@ -393,7 +411,7 @@ with col_config:
     if columns:
         # Auto-detect: manufacturer/product code typically goes in Primary,
         # internal SKU in Fallback. User can flip either dropdown.
-        primary_hints  = ["product_code","mpn","model","manufacturer","mfr","part_no","part_number"]
+        primary_hints  = ["product_code","mpn","model","manufacturer","mfr","part_no","part_number","name","title"]
         fallback_hints = ["sku","item","id","code"]
 
         def _auto_index(opts, hints):
@@ -407,7 +425,7 @@ with col_config:
             columns,
             index=_auto_index(columns, primary_hints),
             disabled=is_running,
-            help="Searched first. Typically your Product Code / MPN.",
+            help="Searched first. Can be a product name, MPN, manufacturer code, or any string identifier.",
         )
         # Per-column exact-match toggle. By default the value is wrapped in
         # double quotes for a verbatim Google match. Turn OFF when this
@@ -423,39 +441,51 @@ with col_config:
                 "Wraps the Primary search in double quotes to force Google to "
                 "match the value verbatim. ON by default for unambiguous codes. "
                 "Turn OFF when the code is formatted differently across sites — "
-                "e.g. you store 'WVE-T60S' but pages render it as 'WVE T60 S'."
+                "e.g. you store 'WVE-T60S' but pages render it as 'WVE T60 S', "
+                "or when searching by product name where quoting kills loose "
+                "matching."
             ),
         )
 
-        fallback_options = [c for c in columns if c != primary_column]
-        fallback_column = st.selectbox(
-            "Fallback search column (required)",
+        # Fallback column is OPTIONAL. The "(none)" option disables the
+        # whole fallback path — no fallback search runs, the per-column
+        # exact-match toggle below is hidden, and rows whose primary
+        # search returned no descriptions just come back as-is.
+        fallback_options = ["(none)"] + [c for c in columns if c != primary_column]
+        fallback_column_choice = st.selectbox(
+            "Fallback search column (optional)",
             fallback_options,
             index=_auto_index(fallback_options, fallback_hints),
             disabled=is_running,
-            help="Used when the primary returns nothing relevant, fetches all fail, or extraction comes back description-empty. Typically your internal SKU.",
-        )
-        fallback_exact = st.toggle(
-            "Exact match (quoted)",
-            disabled=is_running,
-            key="fallback_exact_toggle",
             help=(
-                "Same as the Primary toggle, applied to the Fallback search. "
-                "Turn OFF if your fallback column holds values whose formatting "
-                "varies across vendors."
+                "Optional. Used only if the primary search returns no "
+                "extracted descriptions. Typically your internal SKU. "
+                "Leave as '(none)' if you only want to search the primary."
             ),
         )
+        fallback_column = "" if fallback_column_choice == "(none)" else fallback_column_choice
 
-        # Optional category column. Independently useful even with strict
-        # search working perfectly: codes like "1204086639" or "105666" can
-        # legitimately match different products in different industries
-        # (105666 hits Thermo Fisher reagents AND Danfoss switch parts).
-        # When set, the category value is appended to the search query as a
-        # loose refinement (never quoted, so Google can match category-related
-        # terms broadly) and is also passed to the LLM prompt so it can
-        # reject pages that describe the wrong industry.
-        category_options = ["(none)"] + [c for c in columns
-                                         if c not in (primary_column, fallback_column)]
+        if fallback_column:
+            fallback_exact = st.toggle(
+                "Exact match (quoted)",
+                disabled=is_running,
+                key="fallback_exact_toggle",
+                help=(
+                    "Same as the Primary toggle, applied to the Fallback search. "
+                    "Turn OFF if your fallback column holds values whose formatting "
+                    "varies across vendors."
+                ),
+            )
+
+        # Optional category column. Independently useful: codes like
+        # "1204086639" or "105666" can legitimately match different
+        # products in different industries. When set, the category value
+        # is appended to the search query as a loose refinement (never
+        # quoted) and is also passed to the LLM prompt as context.
+        category_options = ["(none)"] + [
+            c for c in columns
+            if c != primary_column and c != fallback_column
+        ]
         category_column = st.selectbox(
             "Category hint column (optional)",
             category_options,
@@ -472,10 +502,10 @@ with col_config:
         )
     else:
         primary_column  = "— upload a file first —"
-        fallback_column = "— upload a file first —"
+        fallback_column = ""
         category_column = "(none)"
         st.selectbox("Primary search column (required)",  ["— upload a file first —"], disabled=True)
-        st.selectbox("Fallback search column (required)", ["— upload a file first —"], disabled=True)
+        st.selectbox("Fallback search column (optional)", ["— upload a file first —"], disabled=True)
         st.selectbox("Category hint column (optional)",   ["— upload a file first —"], disabled=True)
 
     # The download/export logic uses sku_column as the row label — point it at
@@ -512,7 +542,7 @@ with col_config:
 st.divider()
 c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
 
-valid_columns = bool(columns) and primary_column != "— upload a file first —" and fallback_column != "— upload a file first —"
+valid_columns = bool(columns) and primary_column != "— upload a file first —"
 
 can_start = (
     bool(rows) and bool(llm_api_key) and bool(selected_fields)
@@ -542,7 +572,7 @@ if not can_start and not is_running and not is_paused:
     if not llm_api_key:        missing.append(f"enter {key_label}")
     if not serpapi_api_key:    missing.append("enter SerpAPI key")
     if not selected_fields:    missing.append("select at least one field")
-    if not valid_columns:      missing.append("map both Primary and Fallback columns")
+    if not valid_columns:      missing.append("map a Primary column")
     if missing:
         st.caption(f"⚠️  To start: {', '.join(missing)}")
 
@@ -585,7 +615,7 @@ if start_btn and not is_paused:
     for row in rows:
         ids = IdentifierSet(
             primary  = str(row.get(primary_column, "")  or "").strip(),
-            fallback = str(row.get(fallback_column, "") or "").strip(),
+            fallback = str(row.get(fallback_column, "") or "").strip() if fallback_column else "",
             category = str(row.get(_cat_col, "") or "").strip() if _cat_col else "",
         )
         if not ids.is_empty():
@@ -605,7 +635,7 @@ if start_btn and not is_paused:
         "urls_per_sku":      urls_per_sku,
         "max_chars":         max_chars,
         "primary_column":    primary_column,
-        "fallback_column":   fallback_column,
+        "fallback_column":   fallback_column or "(none)",
         "category_column":   _cat_col or "(none)",
         "blocked_domains":   [d for d in (blocked_domains_text or "").splitlines() if d.strip()],
         "provider":          provider_key,
@@ -714,6 +744,7 @@ if is_running and st.session_state["work_queue"]:
 
     rate_limited = False
     batch_errors = []   # collected (sku, error_msg) for display below the progress bar
+    rate_limited_keys: set = set()  # identifier keys of rows that need re-queueing
 
     for result in batch_results:
         s = st.session_state["stats"]
@@ -722,10 +753,19 @@ if is_running and st.session_state["work_queue"]:
         elif result.status == "review":
             s["review"] += 1
         elif result.status == "rate_limited":
-            s["rate_limited"] += 1
+            # Don't count or persist this row — it's going back into the
+            # work queue and will be retried on resume. Counting/persisting
+            # now would either double-count it (success-after-retry while
+            # stats["rate_limited"] still reflects the failed attempt) or
+            # leave a permanent RATE_LIMITED stub in the output.
             st.session_state["rate_limit_hit"] = True
             rate_limited = True
+            rate_limited_keys.add((
+                (result.primary_value or "").lower(),
+                (result.fallback_value or "").lower(),
+            ))
             status_box.error(f"🚫 Rate limit hit on **{result.sku}**. Pausing — results so far are safe to download.")
+            continue   # skip the data persistence below
         elif result.status in ("not_found", "blocked"):
             s["not_found"] += 1
             # Surface the actual reason (HTTP 403, timeout, recall-and-precision
@@ -763,7 +803,28 @@ if is_running and st.session_state["work_queue"]:
                 "error_msg":      result.error_msg,
             })
 
-    st.session_state["completed_count"] += len(batch)
+    # Re-queue rate-limited rows at the FRONT of the work queue so resume
+    # retries them first. Without this, a 429 mid-batch silently drops
+    # every rate-limited row from the run — the row never gets retried,
+    # and the output shows a RATE_LIMITED stub instead of enriched data.
+    requeued_count = 0
+    if rate_limited_keys:
+        requeue: list = []
+        for ids, row in batch:
+            key = (
+                (ids.primary  or "").strip().lower(),
+                (ids.fallback or "").strip().lower(),
+            )
+            if key in rate_limited_keys:
+                requeue.append((ids, row))
+        if requeue:
+            st.session_state["work_queue"] = requeue + st.session_state["work_queue"]
+            requeued_count = len(requeue)
+
+    # Increment completed_count by the number of rows that ACTUALLY
+    # finished. Otherwise the progress bar overshoots and the run looks
+    # "done" before the queued retries finish.
+    st.session_state["completed_count"] += (len(batch) - requeued_count)
 
     # Surface errors from this batch directly under the progress bar so the
     # user sees what's failing in real time, not just an opaque ERROR flag.
@@ -1117,18 +1178,26 @@ if st.session_state["results"]:
                     url       = page["url"]
                     chars     = page["cleaned_chars"]
                     text      = page["cleaned_text"]
-                    validates = page.get("validates", True)
+                    # Backward-compat with old debug logs: the field was
+                    # renamed from `validates` to `overlaps_identifier` when
+                    # the validation flag became the LOW_CONFIDENCE flag.
+                    overlaps  = page.get("overlaps_identifier",
+                                         page.get("validates", True))
                     max_c     = max_chars
 
                     pct_used = min(100, round(chars / max_c * 100)) if max_c else 100
                     bar_fill = "▓" * (pct_used // 5) + "░" * (20 - pct_used // 5)
 
-                    validates_label = "✓ identifier matched in content" if validates else "⚠️ no identifier match — possible wrong product"
+                    overlaps_label = (
+                        "✓ identifier tokens found in content"
+                        if overlaps
+                        else "⚠️ no token overlap — flagged LOW_CONFIDENCE"
+                    )
 
                     st.markdown(
                         f"**Source {i}:** [{url}]({url})  \n"
                         f"`{chars:,} / {max_c:,} chars [{bar_fill}] {pct_used}%`  \n"
-                        f"{validates_label}"
+                        f"{overlaps_label}"
                     )
                     if chars == max_c:
                         st.warning(

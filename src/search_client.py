@@ -49,12 +49,6 @@ LOW_VALUE_DOMAINS = {
     "wish.com", "ebay.com.au", "answers.yahoo.com",
 }
 
-HIGH_VALUE_SIGNALS = [
-    "/product/", "/products/", "/item/", "/p/", "/catalogue/",
-    "/shop/", "/detail/", "productdetail", "specifications", "specs",
-    "datasheet", "/buy/",
-]
-
 _BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -227,29 +221,69 @@ def search(query: str, cfg: SearchConfig) -> list[dict]:
     return results
 
 
+def _tokenise_identifier(identifier: str) -> list[str]:
+    """Split an identifier into alphanumeric word tokens, lowercased.
+
+    Splits on whitespace AND punctuation, so 'LD Systems MAUI 5' and
+    'LD-Systems-MAUI-5' both produce ['ld','systems','maui','5'].
+    Single-character noise tokens are dropped unless they're digits —
+    a stray 'a' or 'e' isn't strong enough evidence of a match, but a
+    single-digit '5' inside a model name carries real signal.
+    """
+    if not identifier:
+        return []
+    buf = [(ch if ch.isalnum() else " ") for ch in identifier.lower()]
+    raw = "".join(buf).split()
+    seen: set = set()
+    out: list[str] = []
+    for t in raw:
+        if (len(t) >= 2 or t.isdigit()) and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
 def _has_relevant_match(results: list[dict], identifier: str) -> bool:
     """
     Did Google actually find what we asked for, or just adjacent junk?
 
-    Uses normalised matching (strips hyphens, spaces, punctuation, lowercases)
-    against the URL + title + snippet of each result. If at least one result
-    contains the normalised identifier as a substring, we consider the search
-    "relevant" and don't trigger the fallback. Otherwise the primary search
-    is treated as a miss even though it returned hits.
+    Tokenises the identifier into alphanumeric words and checks how many
+    appear in the URL + title + snippet of each result. A result is
+    considered a match when at least 50% of the identifier tokens appear
+    somewhere in its haystack — this tolerates Google's snippet truncation
+    (which routinely cuts mid-phrase with `...`) while still rejecting
+    results that share only the brand or category. Single-token
+    identifiers still need that one token, so the bar stays meaningful.
 
-    The normalisation lets 'LDS-MAUI5' match 'LDS-MAUI-5-W-SUB' but reject
-    pages that only mention the brand without the specific model code.
+    Used by search_for_product to decide whether to fire the fallback
+    search. With a "secondary on no extracted results" rule this is the
+    only place fallback can trigger from the search stage — so getting
+    the threshold right matters: too lax, fallback never runs; too
+    strict, fallback runs constantly and wastes SerpAPI quota.
     """
-    norm_id = _normalise_for_match(identifier)
-    if not norm_id:
+    tokens = _tokenise_identifier(identifier)
+    if not tokens:
         return True   # nothing to check against — assume relevant
+
+    needed = max(1, (len(tokens) + 1) // 2)
+
+    # Punctuation-stripped concatenation as a bonus path — catches the
+    # case where 'WVE-T60S' is rendered as 'WVET60S' in a page title and
+    # ended up tokenised differently from the haystack version.
+    concat = "".join(tokens)
+
     for r in results:
         haystack = " ".join([
             r.get("url", "") or "",
             r.get("title", "") or "",
             r.get("snippet", "") or "",
-        ])
-        if norm_id in _normalise_for_match(haystack):
+        ]).lower()
+        if not haystack.strip():
+            continue
+        if len(concat) >= 4 and concat in _normalise_for_match(haystack):
+            return True
+        hits = sum(1 for t in tokens if t in haystack)
+        if hits >= needed:
             return True
     return False
 
@@ -322,32 +356,49 @@ def search_for_product(ids: IdentifierSet, cfg: SearchConfig) -> tuple[list[dict
     return [], ""
 
 
-def score_url(result: dict, extra_blocked: set | None = None) -> int:
-    url    = (result.get("url") or "").lower()
-    title  = (result.get("title") or "").lower()
+def _is_blocked_domain(url: str, blocked: set) -> bool:
+    """True if the URL's domain is blocked (exact match or a subdomain).
+
+    Exact-or-subdomain matching only — substring matching used to block
+    'rolex.com', 'fedex.com', 'swish.com' purely because the blocklist
+    contains 'x.com' and 'wish.com'. Now 'shop.x.com' is blocked (a
+    real x.com subdomain), but 'rolex.com' is fine.
+    """
     domain = url.split("/")[2] if url.count("/") >= 2 else url
-    if url.endswith(".pdf"):
-        return -1
-    blocked = LOW_VALUE_DOMAINS | (extra_blocked or set())
-    if any(bad in domain for bad in blocked):
-        return -1
-    score = 0
-    for sig in HIGH_VALUE_SIGNALS:
-        if sig in url:
-            score += 2
-    if "spec" in title or "product" in title:
-        score += 1
-    if domain.count(".") == 1:
-        score += 3
-    return score
+    domain = domain.lower()
+    if domain.startswith("www."):
+        domain = domain[4:]
+    for bad in blocked:
+        bad_norm = (bad or "").lower().lstrip(".")
+        if not bad_norm:
+            continue
+        if domain == bad_norm or domain.endswith("." + bad_norm):
+            return True
+    return False
 
 
 def select_top_urls(results: list[dict], n: int, extra_blocked: set | None = None) -> list[dict]:
-    scored = [(score_url(r, extra_blocked), r) for r in results]
-    scored = [(s, r) for s, r in scored if s >= 0]
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top = [r for _, r in scored[:n]]
-    return top if top else []
+    """Walk the SERP top-to-bottom and return the first N results that
+    aren't on the blocklist and aren't PDFs (trafilatura can't extract
+    those — they'd just fail and burn a fetch).
+
+    Order is exactly Google's order. No re-ranking, no scoring rubric.
+    If you want different URLs, add to the blocklist or raise n.
+    """
+    blocked = LOW_VALUE_DOMAINS | (extra_blocked or set())
+    out: list[dict] = []
+    for r in results:
+        if len(out) >= n:
+            break
+        url = (r.get("url") or "").strip()
+        if not url:
+            continue
+        if url.lower().endswith(".pdf"):
+            continue
+        if _is_blocked_domain(url, blocked):
+            continue
+        out.append(r)
+    return out
 
 
 # ── Fetch ─────────────────────────────────────────────────────────────────────
@@ -478,22 +529,33 @@ def fetch_page(url: str, cfg: SearchConfig) -> dict:
 def fetch_pages_for_product(
     ids: IdentifierSet,
     cfg: SearchConfig,
+    cancel_event=None,
 ) -> tuple[list[dict], str, str, list[dict]]:
     """
-    Per-product pipeline: search → score top URLs → fetch.
+    Per-product pipeline: search → top-to-bottom URL pick → fetch.
     Returns (pages, status, query_used, fetch_errors).
 
     fetch_errors is a list of {url, error} entries for URLs that were tried
     and failed, plus a synthetic entry if all results were filtered out by
-    the domain blocklist before any fetch was attempted. Used by the pipeline
-    to surface BLOCKED diagnostics in the UI.
+    the domain blocklist before any fetch was attempted.
+
+    cancel_event: optional threading.Event. When set, this function aborts
+    at the next check-point and returns ([], "rate_limited", "", []) without
+    making any further network calls. Used by process_batch to halt
+    in-flight workers as soon as one hits a SerpAPI 429.
     """
     if ids.is_empty():
         return [], "not_found", "", []
 
+    # Pre-search cancellation check.
+    if cancel_event is not None and cancel_event.is_set():
+        return [], "rate_limited", "", []
+
     try:
         results, query = search_for_product(ids, cfg)
     except RateLimitError:
+        if cancel_event is not None:
+            cancel_event.set()
         return [], "rate_limited", "", []
     except BackendConfigError:
         # Misconfigured SerpAPI propagates so the pipeline shows a real error
@@ -522,6 +584,11 @@ def fetch_pages_for_product(
 
     pages: list[dict] = []
     for result in top_urls:
+        # Per-fetch cancellation check — peer thread may have hit a 429
+        # since we entered the loop.
+        if cancel_event is not None and cancel_event.is_set():
+            return [], "rate_limited", query, fetch_errors
+
         try:
             fetched = fetch_page(result["url"], cfg)
         except Exception as e:
@@ -540,93 +607,60 @@ def fetch_pages_for_product(
             })
         time.sleep(cfg.delay_between)
 
-    # ── URL-level rescue ─────────────────────────────────────────────────
-    # If we got pages but NONE of them validate (i.e. none of them mention
-    # the user's identifier in their content after normalisation), the top
-    # of Google's results was probably SEO spam. Scan further down the
-    # candidate list — up to 3 more fetches — to find a validating page.
-    # Caps the cost at urls_per_sku + 3 fetches per row in the worst case.
-    #
-    # Triggered specifically by the case in the user's debug log: with
-    # urls_per_sku=1 and a SEO-spam top result (`crue.idsn.gov.co`), the
-    # pipeline previously gave up after one fetch. Now it falls through to
-    # the next candidate (e.g. bettermusic.com.au, megamusic.com.au).
-    if pages and not any(content_validates_product(p["content"], ids) for p in pages):
-        all_candidates = select_top_urls(results, len(results), extra_blocked)
-        already_tried = {p["url"] for p in pages} | {
-            fe["url"] for fe in fetch_errors if fe.get("url")
-        }
-        rescue_attempts   = 0
-        max_rescue_fetch  = 3
-
-        for candidate in all_candidates:
-            if rescue_attempts >= max_rescue_fetch:
-                break
-            url = candidate["url"]
-            if url in already_tried:
-                continue
-            rescue_attempts += 1
-
-            try:
-                fetched = fetch_page(url, cfg)
-            except Exception as e:
-                fetched = {"ok": False, "error": f"Unexpected: {type(e).__name__}"}
-
-            if fetched.get("ok"):
-                rescued = {
-                    "url":         url,
-                    "content":     fetched["content"],
-                    "jsonld_hint": fetched.get("jsonld"),
-                }
-                if content_validates_product(rescued["content"], ids):
-                    # Success — promote the rescued page to the front of the
-                    # list so the LLM treats it as Source 1. The original
-                    # non-validating pages stay as secondary context, which
-                    # rarely hurts and occasionally helps when they share
-                    # generic spec info.
-                    pages = [rescued] + pages
-                    break
-                # Fetched OK but still doesn't validate — record and keep
-                # looking (don't add to pages: more noise won't help).
-                fetch_errors.append({
-                    "url":   url,
-                    "error": "Rescue: page fetched but identifier not in content",
-                })
-            else:
-                fetch_errors.append({
-                    "url":   url,
-                    "error": f"Rescue fetch: {fetched.get('error', 'Unknown')}",
-                })
-            time.sleep(cfg.delay_between)
-
     if not pages:
         return [], "blocked", query, fetch_errors
     return pages, "ok", query, fetch_errors
 
 
 def _normalise_for_match(s: str) -> str:
-    """
-    Strip non-alphanumeric characters and lowercase. Used to make identifier
-    matching tolerant of formatting differences — so 'LDS-MAUI5' in the
-    user's data matches against page content containing 'LDS-MAUI-5-W-SUB'
-    (both normalise to 'ldsmaui5' / 'ldsmaui5wsub' where the first is a
-    substring of the second).
+    """Strip non-alphanumeric characters and lowercase.
+
+    Used by the bonus-path concatenation match in _has_relevant_match and
+    by content_overlaps_identifier for the punctuation-tolerant compact-SKU
+    case (e.g. 'LDS-MAUI5' should match 'LDS-MAUI-5-W-SUB').
     """
     return "".join(c for c in s.lower() if c.isalnum())
 
 
-def content_validates_product(content: str, ids: IdentifierSet) -> bool:
-    """Sanity check: does primary or fallback value appear in the fetched page?
+def content_overlaps_identifier(content: str, ids: IdentifierSet) -> bool:
+    """Does the fetched content plausibly correspond to the searched identifier?
 
-    Uses normalised matching so 'LDS-MAUI5' matches 'LDS-MAUI-5-W-SUB' and
-    'AAF7075' matches 'AAF7075-00'. Without this, legitimate product pages
-    were being flagged as non-validating purely because of hyphen/space
-    formatting differences.
+    Used by the pipeline to set a LOW_CONFIDENCE flag — NOT to gate
+    extraction or trigger fallbacks. Returns True under either of:
+
+      1. Concatenation match — punctuation-stripped identifier appears as
+         a substring of the punctuation-stripped content. This is the
+         right tool for compact SKU codes like 'LDS-MAUI5' that should
+         match against 'LDS-MAUI-5-W-SUB' on a retailer page.
+      2. Token-majority match — at least half the identifier's word
+         tokens appear in the lowercased content. This is what handles
+         multi-word product names like 'LD Systems MAUI 5 GO E W SET EU'
+         whose concatenated form almost never appears verbatim on real
+         pages even when the page is clearly about the right product.
+
+    Either path counts as overlap. Both paths are conservative: a page
+    that mentions only the brand without the model code won't pass either.
     """
     codes = ids.codes()
     if not codes:
         return True
     if not content:
         return False
-    norm_content = _normalise_for_match(content)
-    return any(_normalise_for_match(c) in norm_content for c in codes if c)
+
+    norm_content  = _normalise_for_match(content)
+    lower_content = content.lower()
+
+    for code in codes:
+        if not code:
+            continue
+        norm_code = _normalise_for_match(code)
+        if len(norm_code) >= 4 and norm_code in norm_content:
+            return True
+        tokens = _tokenise_identifier(code)
+        if not tokens:
+            continue
+        needed = max(1, (len(tokens) + 1) // 2)
+        hits = sum(1 for t in tokens if t in lower_content)
+        if hits >= needed:
+            return True
+    return False

@@ -226,7 +226,16 @@ with st.sidebar:
     )
 
     urls_per_sku = st.slider("URLs per product", 1, 5, 1, disabled=is_running,
-                              help="Number of URLs to fetch from the SERP, taken top-to-bottom in Google's order. Blocked domains and PDFs are skipped. With exact-match searches the top hit is usually correct — 1 is enough most of the time.")
+                              help=(
+                                  "Number of SUCCESSFUL fetches to collect per product. "
+                                  "The pipeline walks the SERP top-to-bottom in Google's "
+                                  "order, skipping blocked domains and PDFs, and keeps "
+                                  "trying URLs until it has this many successful fetches "
+                                  "or the SerpAPI results run out. Failed fetches "
+                                  "(HTTP 403, timeouts, JS-only pages) don't count "
+                                  "toward the target — the next URL gets tried. "
+                                  "1 is enough most of the time."
+                              ))
 
     blocked_domains_text = st.text_area(
         "Blocked domains (one per line)",
@@ -329,11 +338,18 @@ strictly while leaving a product-name primary loose, or vice versa.
 
 #### URL selection
 
-The top **N** SERP results in Google's order are fetched, where N is the
-"URLs per SKU" setting in the sidebar. Blocked domains and PDFs are
-skipped (PDFs can't be cleaned by `trafilatura`). There's no scoring or
-re-ranking — Google's order is preserved. To change which URLs get
-picked, add to the blocked-domains list or raise N.
+The "URLs per product" slider sets the number of **successful** fetches
+to collect per product. The pipeline walks the SERP top-to-bottom in
+Google's order, skipping blocked domains and PDFs (PDFs can't be cleaned
+by `trafilatura`), and keeps trying URLs until it has that many
+successful fetches or the SerpAPI results are exhausted. Failed fetches
+— HTTP 403, Cloudflare blocks, timeouts, JS-only pages — don't count
+toward the target. The next URL just gets tried.
+
+So if you set the slider to 2 and the top 4 results all fail, the
+pipeline keeps walking down to position 5, 6, etc. until it hits 2
+successes or runs out. Every URL it tried, successful or not, is
+recorded in the diagnostic panel.
 
 #### Confidence flags
 
@@ -411,8 +427,7 @@ with col_config:
     if columns:
         # Auto-detect: manufacturer/product code typically goes in Primary,
         # internal SKU in Fallback. User can flip either dropdown.
-        primary_hints  = ["product_code","mpn","model","manufacturer","mfr","part_no","part_number","name","title"]
-        fallback_hints = ["sku","item","id","code"]
+        primary_hints = ["product_code","mpn","model","manufacturer","mfr","part_no","part_number","name","title"]
 
         def _auto_index(opts, hints):
             for i, c in enumerate(opts):
@@ -455,7 +470,7 @@ with col_config:
         fallback_column_choice = st.selectbox(
             "Fallback search column (optional)",
             fallback_options,
-            index=_auto_index(fallback_options, fallback_hints),
+            index=0,   # default to "(none)" — fallback is opt-in, not auto
             disabled=is_running,
             help=(
                 "Optional. Used only if the primary search returns no "
@@ -515,7 +530,7 @@ with col_config:
     st.markdown("**Fields to extract**")
     field_options = {
         "product_name":      "Product Name",
-        "brand":             "Brand",
+        "brand":              "Brand",
         "short_description": "Short Description",
         "long_description":  "Long Description",
         "specifications":    "Specifications",
@@ -524,10 +539,16 @@ with col_config:
         "barcode":           "Barcode (EAN/UPC)",
         "country_of_origin": "Country of Origin",
         "source_url":        "Source URL",
+        "all_source_urls":   "All Source URLs",
         "confidence_score":  "Confidence Score",
         "review_flag":       "Review Flag",
     }
-    default_checked = list(field_options.keys())[:6] + ["review_flag"]
+    # Defaults: same first 6 as before (product_name → category) plus
+    # all_source_urls and review_flag. all_source_urls is on by default
+    # because it gives the user the full audit trail of which pages went
+    # into the LLM, which is more transparent than the LLM's single
+    # "most authoritative" pick.
+    default_checked = list(field_options.keys())[:6] + ["all_source_urls", "review_flag"]
     selected_fields = []
     ca, cb = st.columns(2)
     for i, (key, label) in enumerate(field_options.items()):
@@ -892,12 +913,26 @@ if st.session_state["results"]:
         llm_errors    = [e for e in error_log if e.get("kind") == "llm_error"]
         fetch_blocks  = [e for e in error_log if e.get("kind") == "blocked"]
 
-        n_llm   = len(llm_errors)
-        n_block = len(fetch_blocks)
+        n_llm = len(llm_errors)
+        # n_block counts URL-level fetch failures, not SKUs. Each fetch_block
+        # entry's `error` field looks like "url1 → reason1 | url2 → reason2",
+        # so the URL count is the number of " | " separators + 1 per entry.
+        # Falls back to 1 if the entry shape is unexpected.
+        n_block = sum(
+            max(1, len(str(e.get("error", "")).split(" | ")))
+            for e in fetch_blocks
+        )
+        n_block_skus = len(fetch_blocks)
 
         header_parts = []
-        if n_llm:   header_parts.append(f"{n_llm} extraction error(s)")
-        if n_block: header_parts.append(f"{n_block} fetch block(s)")
+        if n_llm:
+            header_parts.append(f"{n_llm} extraction error(s)")
+        if n_block:
+            # Show URL count, with SKU count in parens when they differ.
+            if n_block == n_block_skus:
+                header_parts.append(f"{n_block} fetch block(s)")
+            else:
+                header_parts.append(f"{n_block} fetch block(s) across {n_block_skus} SKU(s)")
         header = " · ".join(header_parts) or f"{len(error_log)} issue(s)"
 
         with st.expander(f"💥 **Diagnostics — {header}**", expanded=True):

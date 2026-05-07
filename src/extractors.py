@@ -82,7 +82,12 @@ def build_prompt(
         sources += f"\n\n--- SOURCE {i}: {page['url']} ---\n"
         sources += text
 
-    all_fields = list(fields)
+    # Only include fields the LLM knows about in the output template.
+    # Fields not in FIELD_DEFINITIONS (e.g. `all_source_urls`, which is
+    # populated by the pipeline post-extraction) are excluded from the
+    # JSON template so the LLM doesn't try to hallucinate values for them.
+    llm_fields = [f for f in fields if f in FIELD_DEFINITIONS]
+    all_fields = list(llm_fields)
     for auto in ["review_flag", "confidence_score", "source_url"]:
         if auto not in all_fields:
             all_fields.append(auto)
@@ -292,7 +297,13 @@ def extract(
     if not pages:
         return {f: "" for f in fields}
 
-    all_fields = list(fields)
+    # Split selected fields: ones the LLM knows about (everything in
+    # FIELD_DEFINITIONS) vs synthetic fields populated by the pipeline
+    # (e.g. all_source_urls). Only the LLM-known ones get sent to the
+    # provider; synthetic fields get a blank default and the pipeline
+    # overwrites them after extract() returns.
+    llm_fields = [f for f in fields if f in FIELD_DEFINITIONS]
+    all_fields = list(llm_fields)
     for auto in ["review_flag", "confidence_score", "source_url"]:
         if auto not in all_fields:
             all_fields.append(auto)
@@ -307,9 +318,14 @@ def extract(
         else:
             raise ValueError(f"Unknown provider: {cfg.provider}")
     except Exception as e:
-        return {f: "" for f in all_fields} | {"review_flag": "ERROR", "_error": str(e)}
+        # Include ALL selected fields (LLM + synthetic) so downstream code
+        # finds every column it expects to write to.
+        return {f: "" for f in fields} | {"review_flag": "ERROR", "_error": str(e)}
 
-    for f in all_fields:
+    # Reconcile the LLM's response with the full selected-fields list so
+    # synthetic fields (all_source_urls, etc.) get blank defaults — the
+    # pipeline will overwrite them with real values.
+    for f in list(fields) + ["review_flag", "confidence_score", "source_url"]:
         if f not in result:
             result[f] = ""
 

@@ -568,11 +568,28 @@ def fetch_pages_for_product(
         return [], "not_found", query, []
 
     extra_blocked = set(cfg.blocked_domains or ())
-    top_urls = select_top_urls(results, cfg.urls_per_sku, extra_blocked)
+
+    # Build the FULL filtered candidate list in SERP order. The slider
+    # (cfg.urls_per_sku) is the target count of *successful* fetches; we
+    # walk the full list and keep going past failures until we either
+    # accumulate N successes or run out of candidates. Blocked-domain and
+    # PDF candidates are filtered out here so they cost neither a fetch
+    # nor a slot. The natural ceiling on attempts is the SerpAPI result
+    # count itself (cfg.max_results, default 10).
+    candidates: list[dict] = []
+    for r in results:
+        url = (r.get("url") or "").strip()
+        if not url:
+            continue
+        if url.lower().endswith(".pdf"):
+            continue
+        if _is_blocked_domain(url, LOW_VALUE_DOMAINS | extra_blocked):
+            continue
+        candidates.append(r)
 
     fetch_errors: list[dict] = []
 
-    if not top_urls:
+    if not candidates:
         # Every search result was filtered out — most often by the user's
         # blocklist. Surface that explicitly so they understand why.
         sample = ", ".join((r.get("url") or "").split("/")[2] for r in results[:3])
@@ -583,7 +600,13 @@ def fetch_pages_for_product(
         return [], "blocked", query, fetch_errors
 
     pages: list[dict] = []
-    for result in top_urls:
+    for result in candidates:
+        # Stop as soon as we have enough successful fetches. Failures
+        # don't count toward the target, so the loop only exits early on
+        # success.
+        if len(pages) >= cfg.urls_per_sku:
+            break
+
         # Per-fetch cancellation check — peer thread may have hit a 429
         # since we entered the loop.
         if cancel_event is not None and cancel_event.is_set():

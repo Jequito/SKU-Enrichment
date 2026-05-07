@@ -1,22 +1,29 @@
 """
 src/pipeline.py
-Per-product processing with cascade search.
+Per-product processing.
 
 Each work item is (IdentifierSet, original_row). The pipeline:
-  1. Search → fetch (primary, then fallback if primary fails at HTTP level)
-  2. JSON-LD extraction from raw HTML as a trusted hint
-  3. Identifier validation against fetched content
-  4. LLM extraction (always runs, takes JSON-LD hint as foundation)
-  5. NEW: extraction-triggered fallback — if LLM returned empty descriptions,
-     try the fallback column as a fresh search before returning the row.
+  1. Search via SerpAPI on the Primary column (or Fallback if Primary
+     returned zero relevant results), then fetch the top URLs in SERP
+     order, skipping blocked domains and PDFs.
+  2. JSON-LD extraction from raw HTML as a trusted hint for the LLM.
+  3. LLM extraction.
+  4. Extraction-triggered fallback — if the LLM produced no descriptions
+     AND a Fallback column was mapped, re-run the search against the
+     fallback term and adopt the result iff it actually has descriptions.
+  5. Low-confidence flag — if neither set of fetched pages overlaps with
+     the searched identifier (token-majority test, tolerant of multi-word
+     product names), set review_flag=LOW_CONFIDENCE so the user knows the
+     LLM extracted data but the source might not be the right product.
 """
 
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from .search_client import (
     SearchConfig, IdentifierSet,
-    fetch_pages_for_product, content_validates_product,
+    fetch_pages_for_product, content_overlaps_identifier,
     RateLimitError, BackendConfigError,
 )
 from .extractors import LLMConfig, extract
@@ -55,12 +62,17 @@ def _has_descriptions(extracted: dict) -> bool:
 
 
 def _build_debug_pages(pages: list, ids: IdentifierSet) -> list:
-    """Materialise debug entries for the active set of pages."""
+    """Materialise debug entries for the active set of pages.
+
+    `overlaps_identifier` records the LOW_CONFIDENCE check's per-page
+    verdict so the debug panel can show which fetched pages did or didn't
+    appear to be about the searched product.
+    """
     return [{
-        "url":           p["url"],
-        "cleaned_chars": len(p["content"]),
-        "cleaned_text":  p["content"],
-        "validates":     content_validates_product(p["content"], ids),
+        "url":                  p["url"],
+        "cleaned_chars":        len(p["content"]),
+        "cleaned_text":         p["content"],
+        "overlaps_identifier":  content_overlaps_identifier(p["content"], ids),
     } for p in pages]
 
 
@@ -71,18 +83,39 @@ def process_product(
     search_cfg:    SearchConfig,
     llm_cfg:       LLMConfig,
     debug:         bool = False,
+    cancel_event:  "threading.Event | None" = None,
 ) -> SKUResult:
-    """Process a single product end-to-end. Stateless — safe under threading."""
+    """Process a single product end-to-end. Stateless — safe under threading.
+
+    cancel_event: shared across the worker pool. When set (typically by a
+    peer worker that just hit a SerpAPI 429), this function returns a
+    rate_limited result immediately without making any outbound calls.
+    Lets process_batch halt the rest of the pool cleanly instead of
+    letting in-flight workers crash into the same 429.
+    """
 
     sku_label  = ids.display_label()
     primary_v  = (ids.primary  or "").strip()
     fallback_v = (ids.fallback or "").strip()
     category_v = (ids.category or "").strip()
 
+    # Fast-exit if a peer thread has already tripped the rate limit.
+    if cancel_event is not None and cancel_event.is_set():
+        return SKUResult(sku=sku_label, status="rate_limited",
+                         data=_empty_row(original_row, output_fields, "RATE_LIMITED"),
+                         sources=[],
+                         error_msg="Aborted: peer thread hit SerpAPI rate limit",
+                         primary_value=primary_v, fallback_value=fallback_v,
+                         category_value=category_v)
+
     # 1. Search + fetch
     try:
-        pages, fetch_status, query_used, fetch_errors = fetch_pages_for_product(ids, search_cfg)
+        pages, fetch_status, query_used, fetch_errors = fetch_pages_for_product(
+            ids, search_cfg, cancel_event=cancel_event,
+        )
     except RateLimitError as e:
+        if cancel_event is not None:
+            cancel_event.set()
         return SKUResult(sku=sku_label, status="rate_limited",
                          data=_empty_row(original_row, output_fields, "RATE_LIMITED"),
                          sources=[], error_msg=str(e),
@@ -95,70 +128,20 @@ def process_product(
                          primary_value=primary_v, fallback_value=fallback_v,
                          category_value=category_v)
 
-    # Pre-compute attribution helpers used by both fallback hooks below.
-    # `fallback_distinct` doesn't change once set; `used_primary_query`
-    # reflects the FIRST successful query and gets stale if the post-fetch
-    # fallback later promotes a different query — we recompute it
-    # against the current `query_used` whenever we need a fresh read.
-    fallback_distinct = (
-        bool(fallback_v) and
-        fallback_v.lower() != primary_v.lower()
-    )
-    used_primary_query = (
-        bool(primary_v) and
-        query_used.strip().strip('"').lower() == primary_v.lower()
-    )
+    if fetch_status == "rate_limited":
+        if cancel_event is not None:
+            cancel_event.set()
+        return SKUResult(sku=sku_label, status="rate_limited",
+                         data=_empty_row(original_row, output_fields, "RATE_LIMITED"),
+                         sources=[], error_msg="SerpAPI rate limited",
+                         query_used=query_used,
+                         primary_value=primary_v, fallback_value=fallback_v,
+                         category_value=category_v)
 
-    # 1b. Post-fetch fallback retry. Triggers when the first attempt came back
-    # blocked/not-found AND the winning query was the primary (which means the
-    # search-stage relevance trigger didn't already fire the fallback). Catches
-    # cases like: Google found a relevant URL, but it was on your blocklist /
-    # returned 403 / was a JS-only page. Without this, those rows would just
-    # die as BLOCKED even when the user has a perfectly good fallback column.
-    if (fetch_status in ("blocked", "not_found")
-            and used_primary_query
-            and fallback_distinct):
-        # Construct as fallback-in-the-fallback-slot so search_for_product's
-        # existing logic naturally applies cfg.fallback_exact (not
-        # cfg.primary_exact). Earlier this was put in the primary slot,
-        # which silently flipped the exact-match setting — quoting fallback
-        # terms even when the user had Fallback exact match OFF.
-        fallback_only = IdentifierSet(primary="", fallback=fallback_v, category=category_v)
-        try:
-            pages_fb, status_fb, query_fb, errors_fb = fetch_pages_for_product(
-                fallback_only, search_cfg
-            )
-            if status_fb == "ok" and pages_fb:
-                # Fallback rescued the row — adopt its results, but combine
-                # the failure errors from attempt 1 so the user can still
-                # see what went wrong with the primary.
-                pages         = pages_fb
-                fetch_status  = "ok"
-                query_used    = query_fb
-                fetch_errors  = (fetch_errors or []) + (errors_fb or [])
-            else:
-                # Fallback also didn't yield pages — record both attempts'
-                # failures in fetch_errors so the diagnostic panel shows the
-                # full journey.
-                fetch_errors = (fetch_errors or []) + [
-                    {"url": "", "error":
-                     f"Post-fetch fallback '{fallback_v}' also returned {status_fb}"}
-                ] + (errors_fb or [])
-        except RateLimitError as e:
-            fetch_errors = (fetch_errors or []) + [
-                {"url": "", "error": f"Fallback search rate-limited: {e}"}
-            ]
-        except BackendConfigError:
-            raise
-        except Exception as e:
-            fetch_errors = (fetch_errors or []) + [
-                {"url": "", "error": f"Fallback search error: {type(e).__name__}: {e}"}
-            ]
-
-    if fetch_status in ("not_found", "blocked", "rate_limited"):
+    if fetch_status in ("not_found", "blocked"):
         # Build a readable summary of why fetches failed so the user sees
-        # actual reasons (HTTP 403, timeout, etc.) instead of an opaque
-        # BLOCKED flag. Limited to first 3 attempts to keep the panel tidy.
+        # actual reasons (HTTP 403, timeout, blocklisted, etc.) instead of
+        # an opaque flag. Limited to first 3 attempts to keep the panel tidy.
         block_msg = ""
         if fetch_errors:
             parts = []
@@ -184,17 +167,10 @@ def process_product(
             jsonld_hint = candidate
             break
 
-    # 3. Validate page content references at least one identifier code.
-    #    If no page mentions our codes, the search may have surfaced the
-    #    wrong product entirely — flag for review even if extraction succeeds.
-    any_validates = any(
-        content_validates_product(p["content"], ids) for p in pages
-    )
-
-    # 4. Capture debug info if requested
+    # 3. Capture debug info if requested
     debug_pages = _build_debug_pages(pages, ids) if debug else []
 
-    # 5. LLM extraction (primary attempt)
+    # 4. LLM extraction (primary attempt)
     try:
         extracted = extract(ids, pages, output_fields, llm_cfg,
                             jsonld_hint=jsonld_hint,
@@ -207,41 +183,36 @@ def process_product(
                          primary_value=primary_v, fallback_value=fallback_v,
                          category_value=category_v)
 
-    # 5b. Extraction-triggered fallback. The HTTP-level fallback above only
-    # fires when the page fetch fails outright. But Google can return a
-    # HTTP-200 page that's content-thin (replacement-parts listing, sparse
-    # PDF spec sheet, manufacturer's discontinued-product stub) — those
-    # finish "successful" with empty short/long descriptions and the user
-    # never gets the rich page that the fallback column might have led to.
-    #
-    # Trigger conditions:
-    #   - LLM result has no descriptions, AND
-    #   - the winning query came from the primary (re-read fresh in case
-    #     the post-fetch fallback already promoted query_used), AND
-    #   - a distinct fallback value exists, AND
-    #   - the LLM didn't error out (otherwise the row is already broken
-    #     and a second extraction won't help diagnose what went wrong).
+    # 5. Extraction-triggered fallback. If the LLM came back with no
+    # descriptions and we have a distinct Fallback column value to try,
+    # re-run the search using the fallback term and adopt that result iff
+    # it actually populates descriptions. This is the ONLY pipeline-level
+    # fallback trigger — fetch failures (blocked/not_found) used to also
+    # trigger a fallback search, but that's been removed to match the
+    # "secondary if primary returns no extracted results" rule.
+    fallback_distinct = (
+        bool(fallback_v) and fallback_v.lower() != primary_v.lower()
+    )
     flag_now = str(extracted.get("review_flag", "") or "").upper()
-    current_used_primary = (
+    used_primary_query = (
         bool(primary_v) and
         query_used.strip().strip('"').lower() == primary_v.lower()
     )
 
     if (not _has_descriptions(extracted)
             and "ERROR" not in flag_now
-            and current_used_primary
+            and used_primary_query
             and fallback_distinct):
-        # Same slot fix as the post-fetch fallback: put fallback_v in the
-        # FALLBACK slot so search_for_product applies cfg.fallback_exact
-        # rather than cfg.primary_exact. Without this the user's "Fallback
-        # exact match: OFF" setting was being silently ignored every time
-        # this fallback level fired.
+        # Put fallback_v in the FALLBACK slot so search_for_product
+        # applies cfg.fallback_exact (not cfg.primary_exact).
         fallback_only = IdentifierSet(primary="", fallback=fallback_v, category=category_v)
         try:
             pages_fb, status_fb, query_fb, errors_fb = fetch_pages_for_product(
-                fallback_only, search_cfg
+                fallback_only, search_cfg, cancel_event=cancel_event,
             )
         except RateLimitError:
+            if cancel_event is not None:
+                cancel_event.set()
             pages_fb, status_fb, query_fb, errors_fb = [], "rate_limited", "", []
         except BackendConfigError:
             raise
@@ -249,9 +220,6 @@ def process_product(
             pages_fb, status_fb, query_fb, errors_fb = [], "error", "", []
 
         if status_fb == "ok" and pages_fb:
-            # Pull a fresh JSON-LD hint from the fallback pages — we want
-            # the LLM to have the strongest possible structured-data
-            # foundation for this second attempt.
             jsonld_hint_fb = None
             for page in pages_fb:
                 candidate = page.get("jsonld_hint")
@@ -266,44 +234,48 @@ def process_product(
             except Exception:
                 extracted_fb = {}
 
-            # Only adopt the fallback result when it actually rescues the
-            # missing descriptions. If it ALSO came back description-less,
+            # Only adopt the fallback result when it actually rescues
+            # missing descriptions. If it ALSO came back description-less
             # the original primary result (which at least has product_name,
             # specs, etc.) is still the better answer.
             if _has_descriptions(extracted_fb):
-                extracted     = extracted_fb
-                pages         = pages_fb
-                sources       = [p["url"] for p in pages]
-                query_used    = query_fb
-                jsonld_hint   = jsonld_hint_fb
-                # Re-validate against the ORIGINAL identifier set — we still
-                # want the validation flag to reflect whether the new pages
-                # mention the user's actual codes, not the standalone
-                # fallback term we used for searching.
-                any_validates = any(
-                    content_validates_product(p["content"], ids) for p in pages
-                )
+                extracted   = extracted_fb
+                pages       = pages_fb
+                sources     = [p["url"] for p in pages]
+                query_used  = query_fb
+                jsonld_hint = jsonld_hint_fb
                 if debug:
                     debug_pages = _build_debug_pages(pages, ids)
 
-    # 6. If validation failed, override the flag to REVIEW_NEEDED — content
-    # may be about a different product even if extraction looked clean.
-    if not any_validates:
+    # 6. LOW_CONFIDENCE flag. This is a soft warning, not a gate: data
+    # has been extracted and is being returned to the user, but no fetched
+    # page appears to be about the searched product based on token overlap.
+    # Useful for catching wrong-product matches (numeric SKU collisions,
+    # SEO spam pages that surface for a model number but actually sell a
+    # different product). Does NOT downgrade rows the LLM already flagged
+    # as REVIEW_NEEDED or ERROR — those flags are preserved.
+    any_overlaps = any(
+        content_overlaps_identifier(p["content"], ids) for p in pages
+    )
+    if not any_overlaps:
         existing = str(extracted.get("review_flag", "") or "").upper()
-        if "ERROR" not in existing:
-            extracted["review_flag"] = "REVIEW_NEEDED"
+        # Don't overwrite ERROR/REVIEW_NEEDED — LOW_CONFIDENCE is a softer
+        # signal than either, and stacking them would bury the stronger
+        # warning the LLM already raised.
+        if not any(tag in existing for tag in ("ERROR", "REVIEW")):
+            extracted["review_flag"] = "LOW_CONFIDENCE"
 
-    # Capture the LLM-side error (if any) before stripping it from the row so
-    # it doesn't leak into CSV/Excel exports. The extract() function catches
-    # provider exceptions internally and returns {review_flag: "ERROR",
-    # _error: "..."} — the previous version threw away that error message
-    # AND counted these rows as success because "REVIEW" wasn't in "ERROR".
+    # Capture LLM-side error before stripping it so it doesn't leak into
+    # the CSV/Excel exports.
     llm_error = str(extracted.pop("_error", "") or "")
 
     flag = str(extracted.get("review_flag", "") or "").upper()
     if "ERROR" in flag:
         status = "error"
-    elif "REVIEW" in flag:
+    elif "REVIEW" in flag or "LOW_CONFIDENCE" in flag:
+        # LOW_CONFIDENCE rides the same status bucket as REVIEW_NEEDED so
+        # the UI's existing review counter and filtering still picks it
+        # up. They're distinguished by the review_flag value itself.
         status = "review"
     else:
         status = "success"
@@ -334,25 +306,66 @@ def process_batch(
     """
     Process a list of (IdentifierSet, original_row) tuples concurrently.
     Returns SKUResult objects in completion order.
+
+    Threading + rate limits: a threading.Event is shared across all
+    workers. The first worker to hit a SerpAPI 429 sets the event, which
+    causes:
+      * all queued-but-not-yet-started futures to be cancelled outright
+      * all currently-running workers to abort at their next check-point
+        (entry of process_product, or before any outbound network call
+        inside fetch_pages_for_product)
+    Without this, when one worker out of N hits a 429 the other N-1 hit
+    the same rate-limited endpoint at the same instant and end up logged
+    as ERROR/BLOCKED instead of pausing cleanly for resume.
     """
-    results = []
+    cancel_event = threading.Event()
+
+    results: list = []
+    completed_futures: set = set()
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
             executor.submit(process_product, ids, row, output_fields,
-                            search_cfg, llm_cfg, debug): ids
+                            search_cfg, llm_cfg, debug, cancel_event): (ids, row)
             for ids, row in items
         }
         for future in as_completed(future_map):
+            ids, row = future_map[future]
+            completed_futures.add(future)
             try:
-                results.append(future.result())
+                result = future.result()
             except Exception as e:
-                ids = future_map[future]
-                results.append(SKUResult(
+                result = SKUResult(
                     sku=ids.display_label(), status="error",
                     data={"review_flag": "ERROR", "_error": str(e)},
                     sources=[],
                     primary_value=(ids.primary  or "").strip(),
                     fallback_value=(ids.fallback or "").strip(),
                     category_value=(ids.category or "").strip(),
-                ))
+                )
+            results.append(result)
+
+            if result.status == "rate_limited" and not cancel_event.is_set():
+                cancel_event.set()
+            if cancel_event.is_set():
+                for f in future_map:
+                    f.cancel()
+
+    # Workers cancelled while still queued never produce a result via
+    # as_completed. Synthesise rate_limited stubs for them so the UI can
+    # put them back in the work queue when the user resumes — and so we
+    # never silently drop input rows.
+    if cancel_event.is_set():
+        for future, (ids, row) in future_map.items():
+            if future in completed_futures:
+                continue
+            results.append(SKUResult(
+                sku=ids.display_label(), status="rate_limited",
+                data=_empty_row(row, output_fields, "RATE_LIMITED"),
+                sources=[],
+                error_msg="Cancelled: peer thread hit SerpAPI rate limit",
+                primary_value=(ids.primary  or "").strip(),
+                fallback_value=(ids.fallback or "").strip(),
+                category_value=(ids.category or "").strip(),
+            ))
+
     return results

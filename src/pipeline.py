@@ -139,13 +139,16 @@ def process_product(
                          category_value=category_v)
 
     if fetch_status in ("not_found", "blocked"):
-        # Build a readable summary of why fetches failed so the user sees
-        # actual reasons (HTTP 403, timeout, blocklisted, etc.) instead of
-        # an opaque flag. Limited to first 3 attempts to keep the panel tidy.
+        # Build a readable summary of why every fetch attempt failed so the
+        # user sees actual reasons (HTTP 403, timeout, blocklisted, etc.)
+        # instead of an opaque flag. With the walk-until-N-successes
+        # iterator a single SKU on a heavily blocked site can produce many
+        # entries; we surface all of them rather than truncating, so the
+        # diagnostic panel reflects the full attempt list.
         block_msg = ""
         if fetch_errors:
             parts = []
-            for fe in fetch_errors[:3]:
+            for fe in fetch_errors:
                 if fe.get("url"):
                     parts.append(f"{fe['url']} → {fe['error']}")
                 else:
@@ -268,6 +271,15 @@ def process_product(
     # Capture LLM-side error before stripping it so it doesn't leak into
     # the CSV/Excel exports.
     llm_error = str(extracted.pop("_error", "") or "")
+
+    # Populate all_source_urls — every URL whose content went into the
+    # LLM, comma-separated. Distinct from the LLM's `source_url` field
+    # (which is the model's pick of "most authoritative single source").
+    # Set unconditionally so the column is always present in the output
+    # when the user selects it. Reflects the FINAL pages list, so if the
+    # extraction-triggered fallback fired and replaced the pages, this
+    # is the fallback's URLs not the primary's.
+    extracted["all_source_urls"] = ", ".join(sources) if sources else ""
 
     flag = str(extracted.get("review_flag", "") or "").upper()
     if "ERROR" in flag:

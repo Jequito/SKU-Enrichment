@@ -1239,11 +1239,23 @@ if st.session_state["results"]:
                             "⚠️ Content was truncated at the character limit — "
                             "specs or key details may have been cut. Consider increasing Max chars per page.",
                         )
+                    # IMPORTANT: do NOT pass a `key=` here. With a key, Streamlit
+                    # binds the text_area's value to that key in session_state
+                    # and the `value=` arg becomes only the initial default —
+                    # subsequent renders show the cached state instead. That
+                    # caused a real bug: when the same SKU was scraped twice
+                    # in one session (re-run without Clear, or rate-limit
+                    # retry), the second scrape's clean content went into
+                    # debug_log[*][pages][*][cleaned_text] correctly, the
+                    # downloaded debug log showed it, but the UI text_area
+                    # kept rendering the FIRST scrape's privacy-policy noise
+                    # because it was cached under the stable key. Without a
+                    # key, widget identity is derived from the args (including
+                    # `value=`) so a content change forces a fresh widget.
                     st.text_area(
                         f"Cleaned text — Source {i}",
                         value=text,
                         height=280,
-                        key=f"debug_{sku}_{i}",
                         disabled=True,
                         label_visibility="collapsed",
                     )

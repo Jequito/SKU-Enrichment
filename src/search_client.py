@@ -451,6 +451,42 @@ def fetch_page(url: str, cfg: SearchConfig) -> dict:
     except Exception:
         pass
 
+    # Pre-strip page chrome via XPath. trafilatura's density-based main-content
+    # classifier sometimes picks the wrong block on retailer pages — most
+    # famously, hidden Privacy Policy and Terms modals that are server-rendered
+    # into the DOM as `<dialog>` elements. Those modals are invisible in the
+    # browser (JS opens them on click) but to trafilatura they're just a long
+    # block of well-formatted prose, which scores high in recall mode. On a
+    # gcmusic.com.au product page the privacy modal is ~3,500 words and the
+    # actual product description is ~120 words — recall picks privacy.
+    #
+    # We strip standard structural chrome before extraction: nav menus, page
+    # headers/footers, and dialog/modal containers (both <dialog> and
+    # role="dialog"). Plus aria-hidden subtrees, which is how some sites mark
+    # invisible modal content. Cookie banners and chat widgets get matched by
+    # ID/class substring since there's no semantic HTML for them.
+    #
+    # NOT stripped: <aside>, <section>, generic <div>. Those can legitimately
+    # hold the product description or a specs sidebar; the cost of false
+    # positives outweighs the benefit.
+    chrome_xpath = "|".join([
+        "//nav",
+        "//header",
+        "//footer",
+        "//dialog",
+        '//*[@role="dialog"]',
+        '//*[@role="navigation"]',
+        '//*[@aria-hidden="true"]',
+        # Cookie / consent banners
+        '//*[contains(translate(@id, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "cookie")]',
+        '//*[contains(translate(@class, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "cookie-banner")]',
+        '//*[contains(translate(@class, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "cookie-consent")]',
+        # Live-chat widgets (intercom, drift, zendesk, tawk, etc.)
+        '//*[contains(translate(@id, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "intercom")]',
+        '//*[contains(translate(@id, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "tawk")]',
+        '//*[contains(translate(@id, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "drift-")]',
+    ])
+
     # Two-pass body extraction. Precision mode is the right default for
     # product pages — it drops more boilerplate (nav, related products, FAQs)
     # and gives the LLM a cleaner signal. But on awkwardly-structured pages
@@ -464,17 +500,28 @@ def fetch_page(url: str, cfg: SearchConfig) -> dict:
         include_comments=False,
         output_format="markdown",
         favor_precision=True,
+        prune_xpath=chrome_xpath,
     )
 
     used_recall = False
-    # Threshold raised from 200 → 800. Many product pages return 200–500 chars
-    # of specs, headings and footer text in precision mode while the actual
-    # description paragraph is classified as boilerplate and dropped. The old
-    # 200-char threshold meant those pages bypassed recall entirely, leaving
-    # the LLM with specs but no description. 800 is empirical — most genuine
-    # product pages clear it once descriptions are included; spec-only stubs
-    # don't, which is exactly the case where recall mode helps.
-    if not body or len(body) < 800:
+    # Recall fallback: fires only when precision returned a genuinely small
+    # amount of TOTAL useful content (body + metadata header). The previous
+    # gate looked only at body length with a 800-char threshold, which
+    # misfired on pages with concise product copy:
+    #
+    #   - Genuine product description: 530 chars (well under 800)
+    #   - Metadata (title + meta description): ~250 chars
+    #   - Combined: ~780 chars
+    #
+    # The old gate fired recall mode anyway, recall grabbed the privacy
+    # modal because it was the longest paragraph block in the DOM, and the
+    # 530-char product description got overwritten by 3,500 chars of legal
+    # boilerplate. Counting metadata toward the threshold AND lowering it
+    # to 400 means we only fall back to recall when there's genuinely
+    # almost nothing useful — not when the product copy is just brief.
+    meta_total = sum(len(line) for line in meta_lines)
+    body_len   = len(body or "")
+    if body_len + meta_total < 400:
         recall_body = trafilatura.extract(
             html,
             include_links=False,
@@ -482,11 +529,12 @@ def fetch_page(url: str, cfg: SearchConfig) -> dict:
             include_comments=False,
             output_format="markdown",
             favor_recall=True,
+            prune_xpath=chrome_xpath,
         )
         # Defensive: only adopt recall if it's strictly longer than precision.
         # In rare cases recall returns less (different boilerplate scoring),
         # in which case precision's cleaner output is still preferable.
-        if recall_body and len(recall_body) > len(body or ""):
+        if recall_body and len(recall_body) > body_len:
             body = recall_body
             used_recall = True
 
